@@ -1,0 +1,53 @@
+# holyclaude-cloud — legion configuration
+# Copy to ./legion.toml at the root of the repo you want to swarm against.
+
+[swarm]
+# Hard cap on concurrent cloud workers. Pro session shared across N workers
+# will throttle hard above ~5. Stay conservative.
+max_workers = 5
+
+# Start with 1 worker on first run, observe throttle behavior, then ramp up.
+# Set false to commit to max_workers immediately.
+ramp_first_run = true
+
+# Pause between decomposition and dispatch so the human can review the task graph.
+# Set false for full-autonomous yolo mode.
+human_checkpoint_after_decompose = true
+
+[budget]
+# Hard ceiling for $/hour of Modal spend. 0 means no $ cap (Pro session is free).
+# Set this if you ever flip workers to API auth — runaway autoloops have killed wallets.
+max_dollars_per_hour = 0
+
+# Kill any individual worker that runs longer than this. Tasks needing more
+# should be split.
+worker_timeout_minutes = 30
+
+[reconciler]
+# Max retries for the mediator agent to resolve a merge conflict before
+# escalating to the human.
+mediator_max_retries = 2
+
+# GitHub repo to push branches/PRs to. If empty, inferred from `git remote`.
+github_repo = ""
+
+# Branch prefix for legion-spawned branches.
+branch_prefix = "legion/"
+
+[dispatch]
+# Heuristics router uses for local-vs-cloud routing. The router is an Opus call
+# that takes these as priors. Tweak to bias.
+
+# Tasks under this many files go local by default.
+local_file_threshold = 5
+
+# Tasks over this many estimated minutes go cloud by default.
+cloud_minutes_threshold = 5
+
+# Always-cloud task types (regex on task title).
+always_cloud_patterns = [
+    "(?i)scrape",
+    "(?i)browser test",
+    "(?i)long-running",
+    "(?i)benchmark"
+]

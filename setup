@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# holyclaude-cloud setup
+#
+# Verifies HolyClaude install + Modal CLI auth, pushes secrets,
+# builds the meta-on-meta image. Idempotent — safe to re-run.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# ---------------------------------------------------------------------
+# 1. Locate Modal CLI
+# ---------------------------------------------------------------------
+MODAL_BIN_CANDIDATES=(
+    "/Users/ajsai47/tinker-env/bin/modal"
+    "$HOME/tinker-env/bin/modal"
+    "$(command -v modal 2>/dev/null || true)"
+)
+MODAL_BIN=""
+for cand in "${MODAL_BIN_CANDIDATES[@]}"; do
+    if [[ -n "$cand" && -x "$cand" ]]; then
+        MODAL_BIN="$cand"
+        break
+    fi
+done
+
+if [[ -z "$MODAL_BIN" ]]; then
+    echo "setup: modal CLI not found. Install: pip install modal" >&2
+    exit 1
+fi
+echo "setup: modal CLI -> $MODAL_BIN"
+
+# ---------------------------------------------------------------------
+# 2. Verify modal auth
+# ---------------------------------------------------------------------
+if ! "$MODAL_BIN" token current >/dev/null 2>&1 \
+   && ! "$MODAL_BIN" profile current >/dev/null 2>&1; then
+    echo "setup: modal not authenticated. Run: $MODAL_BIN token new" >&2
+    exit 1
+fi
+echo "setup: modal auth OK"
+
+# ---------------------------------------------------------------------
+# 3. Verify HolyClaude is installed (peer dep)
+# ---------------------------------------------------------------------
+if [[ -d "$HOME/holyclaude" ]] || [[ -L "$HOME/.claude/plugins/holyclaude" ]] || [[ -d "$HOME/.claude/plugins/holyclaude" ]]; then
+    echo "setup: HolyClaude detected"
+else
+    echo "setup: WARNING — HolyClaude not found locally."
+    echo "  Install: git clone https://github.com/ajsai47/holyclaude.git ~/holyclaude && ~/holyclaude/setup"
+    echo "  (Cloud workers don't need it locally — they get HolyClaude from the image clone."
+    echo "   But your local orchestrator does.)"
+fi
+
+# ---------------------------------------------------------------------
+# 4. Push Claude Pro session secret
+# ---------------------------------------------------------------------
+secret_exists() {
+    "$MODAL_BIN" secret list 2>/dev/null | awk '{print $2}' | grep -Fxq "$1"
+}
+
+CREDS_JSON=""
+if [[ "$(uname)" == "Darwin" ]]; then
+    CREDS_JSON="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null || true)"
+fi
+if [[ -z "$CREDS_JSON" && -f "$HOME/.claude/.credentials.json" ]]; then
+    CREDS_JSON="$(cat "$HOME/.claude/.credentials.json")"
+fi
+if [[ -z "$CREDS_JSON" ]]; then
+    echo "setup: could not locate Claude credentials." >&2
+    echo "  Log into Claude Code first." >&2
+    exit 1
+fi
+if ! python3 -c "
+import json,sys
+d = json.loads(sys.stdin.read())
+assert 'claudeAiOauth' in d and 'accessToken' in d['claudeAiOauth']
+" <<< "$CREDS_JSON" >/dev/null 2>&1; then
+    echo "setup: credentials payload missing claudeAiOauth.accessToken" >&2
+    exit 1
+fi
+
+echo "setup: pushing claude-pro-session secret"
+"$MODAL_BIN" secret delete claude-pro-session --yes >/dev/null 2>&1 || true
+"$MODAL_BIN" secret create claude-pro-session \
+    CLAUDE_CREDENTIALS_JSON="$CREDS_JSON"
+
+# ---------------------------------------------------------------------
+# 5. Push GitHub token secret
+# ---------------------------------------------------------------------
+GH_TOKEN=""
+if command -v gh >/dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+fi
+if [[ -z "$GH_TOKEN" && -n "${GITHUB_TOKEN:-}" ]]; then
+    GH_TOKEN="$GITHUB_TOKEN"
+fi
+
+if [[ -z "$GH_TOKEN" ]]; then
+    echo "setup: WARNING — no GitHub token found."
+    echo "  Workers won't be able to push branches or open PRs."
+    echo "  Fix: gh auth login   OR   export GITHUB_TOKEN=ghp_..."
+else
+    echo "setup: pushing legion-github secret"
+    "$MODAL_BIN" secret delete legion-github --yes >/dev/null 2>&1 || true
+    "$MODAL_BIN" secret create legion-github \
+        GITHUB_TOKEN="$GH_TOKEN"
+fi
+
+# ---------------------------------------------------------------------
+# 6. Drop legion.toml if missing in cwd at install time
+# ---------------------------------------------------------------------
+if [[ ! -f "./legion.toml" && ! -f "$PWD/legion.toml" ]]; then
+    cp "$REPO_ROOT/config/legion.toml.example" "$REPO_ROOT/legion.toml"
+    echo "setup: dropped default legion.toml at $REPO_ROOT/legion.toml"
+    echo "  Copy this to any repo you want to swarm against."
+fi
+
+# ---------------------------------------------------------------------
+# 7. Optional: pre-build the image so first /legion-start isn't slow
+# ---------------------------------------------------------------------
+echo ""
+echo "setup: ready."
+echo ""
+echo "Next steps:"
+echo "  1. cd into the repo you want to swarm against."
+echo "  2. Copy legion.toml from $REPO_ROOT/legion.toml (or write your own)."
+echo "  3. In Claude Code: /legion-start \"<your goal>\""
+echo ""
+echo "First /legion-start will build the Modal image (~10-15 min). Subsequent runs reuse the cache."

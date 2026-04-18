@@ -1,0 +1,26 @@
+{
+  "name": "holyclaude-cloud",
+  "description": "Cloud orchestration layer for HolyClaude. Spins up a legion of Claude workers on Modal, each running the full HolyClaude stack, coordinated by a local orchestrator. Decomposes massive coding projects into parallel tasks, dispatches between local subagents and cloud Modal containers, reconciles via GitHub PRs.",
+  "version": "0.1.0",
+  "author": {
+    "name": "AJ Green",
+    "email": "aj@aicollective.com"
+  },
+  "homepage": "https://github.com/ajsai47/holyclaude-cloud",
+  "repository": "https://github.com/ajsai47/holyclaude-cloud",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "plugin",
+    "modal",
+    "orchestration",
+    "swarm",
+    "parallel-agents",
+    "holyclaude",
+    "cloud",
+    "ai-agent"
+  ],
+  "peerDependencies": {
+    "holyclaude": "^1.0.0"
+  }
+}

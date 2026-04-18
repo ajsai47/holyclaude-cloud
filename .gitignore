@@ -1,0 +1,25 @@
+# Local legion run state — never commit
+.legion/
+legion.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (if anything ends up here later)
+node_modules/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local secrets / creds (paranoia — none should be here, but just in case)
+.env
+.env.local
+*.credentials.json
