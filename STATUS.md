@@ -51,12 +51,44 @@ Real working code for concurrent dispatch, atomic state, throttle-aware cap.
       the mediator synthesized both intents ("apples & bananas"),
       force-pushed, retry merged. Main has the combined result.
 
-## Phase 3b — deferred to Phase 4
+## Phase 4 — autonomous runner + auth escape hatch + CI re-dispatch  ✅ shipped
 
-- [ ] CI re-dispatch on test failure (put failing task back in the queue
-      with the failure log as new context)
-- [ ] Resume support: `/legion-start --resume` reads existing
-      `.legion/state.json` and continues mid-run
+- [x] `legion run` — single-command autonomous dispatch/poll/reconcile loop.
+      Handles spawn, poll, reconcile, mediate, ci-redispatch, ramp, throttle
+      backoff, stale-worker reaping, graceful stop. Exits when terminal.
+- [x] Critical fix: `poll_local` completion signal. claude-code sometimes
+      hangs after emitting its terminal `result` event. Was causing runs to
+      get stuck indefinitely. Now reads the stream-json log for
+      `"type":"result"` and kills lingering processes.
+- [x] CI re-dispatch: tasks with `ci_failed` are put back as `pending` with
+      the failing-check details appended to their spec. Capped by
+      `mediator_max_retries`. The next worker sees what broke.
+- [x] `--api` escape hatch: `[swarm] auth_mode = "api"` switches workers to
+      `ANTHROPIC_API_KEY`. Modal secret `anthropic-api-key` is pushed by
+      setup when the env var is set. Applies to local AND cloud workers.
+- [x] Stale-worker reaping: workers past `worker_timeout_minutes` are
+      force-killed and marked failed by `legion run` on each tick.
+- [x] `legion scale auto` clears `max_workers_override`.
+- [x] `/legion-start --resume` — skip decompose + init, continue from
+      existing `.legion/state.json`.
+- [x] Orchestrator skill rewritten around `legion run` — short, focused on
+      decomposition + checkpoint + narration. The run loop owns everything
+      else.
+- [x] Live-validated: 3-task DAG (A, B independent; C depends on both)
+      completed autonomously in 6 ticks. Spawn/ship/merge/dispatch-downstream
+      all interleaved automatically. PRs #17, #18, #19 merged, final repo
+      state correct (C imports from A and B).
+
+## Phase 5 — deferred (lower priority)
+
+- [ ] Real Modal billing API integration in `legion cost`
+- [ ] Per-worker repo cache (shared bare clone, `git clone --reference`)
+- [ ] `claude-peers` integration so other Claude Code sessions see the
+      in-flight legion
+- [ ] HolyClaude pin upgrade workflow (`./setup --upgrade-holyclaude`)
+- [ ] First-class autoloop integration (`/legion-start --autoloop <preset>`)
+- [ ] Per-task override target (`legion spawn <id> --target cloud` already
+      works; want a one-shot way to re-route an in-flight task)
 
 ## Phase 4 — Polish
 
