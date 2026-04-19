@@ -112,14 +112,23 @@ fi
 # 5b. Push Anthropic API key secret (for auth_mode="api" escape hatch)
 # ---------------------------------------------------------------------
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "setup: pushing anthropic-api-key secret (auth_mode='api' escape hatch)"
+    echo "setup: pushing anthropic-api-key secret (real key — escape hatch enabled)"
     "$MODAL_BIN" secret delete anthropic-api-key --yes >/dev/null 2>&1 || true
     "$MODAL_BIN" secret create anthropic-api-key \
         ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 else
-    echo "setup: no ANTHROPIC_API_KEY in env — skipping anthropic-api-key secret"
-    echo "  (fine; legion.toml [swarm] auth_mode defaults to 'session'.)"
-    echo "  Set the env var and re-run setup if you want the --api escape hatch."
+    # Still push a placeholder — Modal attaches secrets at decorator time,
+    # not at runtime, so the worker function body won't load at all if this
+    # secret doesn't exist. The worker validates the key value before using
+    # it, so a placeholder is safely ignored when auth_mode=session.
+    if ! "$MODAL_BIN" secret list 2>/dev/null | awk '{print $2}' | grep -Fxq "anthropic-api-key"; then
+        echo "setup: no ANTHROPIC_API_KEY in env — pushing placeholder anthropic-api-key"
+        echo "  (decorator needs the secret to exist; auth_mode=session ignores the value)"
+        "$MODAL_BIN" secret create anthropic-api-key \
+            ANTHROPIC_API_KEY="placeholder-run-setup-with-ANTHROPIC_API_KEY-set-to-enable-api-mode"
+    else
+        echo "setup: anthropic-api-key secret already exists — not touching it"
+    fi
 fi
 
 # ---------------------------------------------------------------------

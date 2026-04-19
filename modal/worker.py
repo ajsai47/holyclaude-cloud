@@ -93,21 +93,15 @@ WORKER_CACHE_VOLUME = "holyclaude-cloud-worker-cache"
 shared_brain = modal.Volume.from_name(SHARED_BRAIN_VOLUME, create_if_missing=True)
 worker_cache = modal.Volume.from_name(WORKER_CACHE_VOLUME, create_if_missing=True)
 
-# Always attach both auth secrets; the worker picks one at runtime based
-# on the --auth-mode parameter. `anthropic-api-key` may not exist yet —
-# wrap in a try so workers keep working with just Pro session auth.
-def _optional_secret(name: str):
-    try:
-        return modal.Secret.from_name(name)
-    except Exception:
-        return None
-
-_auth_secrets = [s for s in (
-    _optional_secret("claude-pro-session"),
-    _optional_secret("anthropic-api-key"),
-) if s is not None]
-
-SECRETS = _auth_secrets + [modal.Secret.from_name("legion-github")]
+# Attach both auth secrets. `anthropic-api-key` may be a placeholder
+# (setup pushes one if ANTHROPIC_API_KEY isn't in the user's env); the
+# worker runtime checks if the value is a real key before using it.
+# Both secrets MUST exist — run `~/holyclaude-cloud/setup` to push them.
+SECRETS = [
+    modal.Secret.from_name("claude-pro-session"),
+    modal.Secret.from_name("anthropic-api-key"),
+    modal.Secret.from_name("legion-github"),
+]
 
 
 app = modal.App("holyclaude-cloud-worker")
@@ -199,12 +193,13 @@ def _run_task_body(
     # 1. Auth setup — pick auth_mode
     # ---------------------------------------------------------------
     if auth_mode == "api":
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or ""
+        if not api_key or api_key.startswith("placeholder-"):
             raise RuntimeError(
-                "auth_mode=api but ANTHROPIC_API_KEY not set. Push the "
-                "anthropic-api-key Modal secret (setup script does this "
-                "automatically if the env var is set locally)."
+                "auth_mode=api but ANTHROPIC_API_KEY is unset or a "
+                "placeholder. Run `~/holyclaude-cloud/setup` with "
+                "ANTHROPIC_API_KEY exported in your shell to push the real "
+                "key, then retry."
             )
         # Clear any pro session creds to avoid claude-code preferring them
         creds_path = Path.home() / ".claude" / ".credentials.json"

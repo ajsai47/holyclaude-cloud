@@ -28,6 +28,14 @@ from .state import Task
 REVIEW_LOG_ROOT = Path(".legion/review_logs")
 REVIEW_VERDICT_JSON_RE = re.compile(r"\{[\s\S]*?\"verdict\"[\s\S]*?\}")
 
+# Diff size limits. Hard cap is what we send to the reviewer; over this
+# we do a head+tail cut so the reviewer sees both ends. Warnings are
+# forced on any truncated review regardless of reviewer's stated verdict
+# (other than critical, which we honor).
+DIFF_MAX_BYTES = 40_000
+DIFF_HEAD_BYTES = 20_000
+DIFF_TAIL_BYTES = 18_000
+
 
 def fetch_pr_diff(pr_url: str | None) -> str:
     """Return the full diff of the PR as a string. Empty string on error."""
@@ -43,15 +51,34 @@ def fetch_pr_diff(pr_url: str | None) -> str:
     return result.stdout
 
 
-def _frame_review_prompt(task: Task, diff: str, categories: list[str]) -> str:
+def _frame_review_prompt(task: Task, diff: str, categories: list[str]) -> tuple[str, bool]:
+    """Returns (framed_prompt, was_truncated)."""
     cat_list = ", ".join(categories)
-    diff_truncated = diff[:40000] if len(diff) > 40000 else diff
-    truncation_note = (
-        "\n\n[note: diff truncated at 40KB — reviewer sees first part only]"
-        if len(diff) > 40000 else ""
-    )
+    was_truncated = False
+    if len(diff) > DIFF_MAX_BYTES:
+        was_truncated = True
+        head = diff[:DIFF_HEAD_BYTES]
+        tail = diff[-DIFF_TAIL_BYTES:]
+        omitted = len(diff) - DIFF_HEAD_BYTES - DIFF_TAIL_BYTES
+        diff_display = (
+            f"{head}\n\n"
+            f"... [MIDDLE OF DIFF OMITTED: {omitted:,} bytes, "
+            f"~{omitted // 50:,} lines not shown. Flag this in your verdict.] ...\n\n"
+            f"{tail}"
+        )
+        truncation_note = (
+            f"\n\n**IMPORTANT: THIS DIFF WAS TRUNCATED.** "
+            f"Original size {len(diff):,} bytes, you see "
+            f"{DIFF_HEAD_BYTES + DIFF_TAIL_BYTES:,} bytes (head + tail). "
+            f"You cannot verify the middle. Your verdict should reflect this: "
+            f"default to `warnings` with a note about unreviewable content, "
+            f"unless you find a critical issue in what you CAN see."
+        )
+    else:
+        diff_display = diff
+        truncation_note = ""
 
-    return (
+    prompt = (
         f"You are the LEGION REVIEWER for task `{task.id}`. You work independently\n"
         f"from the worker who produced this diff — be rigorous, don't rubber-stamp.\n"
         f"\n"
@@ -64,7 +91,7 @@ def _frame_review_prompt(task: Task, diff: str, categories: list[str]) -> str:
         f"## Diff of their PR (what actually got written)\n"
         f"\n"
         f"```diff\n"
-        f"{diff_truncated}\n"
+        f"{diff_display}\n"
         f"```{truncation_note}\n"
         f"\n"
         f"## Your review categories\n"
@@ -116,6 +143,7 @@ def _frame_review_prompt(task: Task, diff: str, categories: list[str]) -> str:
         f"DO NOT modify any files. DO NOT run tools. DO NOT push or comment.\n"
         f"Just output the JSON verdict.\n"
     )
+    return prompt, was_truncated
 
 
 def _parse_verdict(output: str) -> dict | None:
@@ -166,32 +194,45 @@ def review_pr(task: Task, cfg: ReviewConfig) -> dict:
     if not diff:
         return {"verdict": "error", "error": "empty diff (gh pr diff failed or no changes)"}
 
-    framed = _frame_review_prompt(task, diff, cfg.categories)
+    framed, was_truncated = _frame_review_prompt(task, diff, cfg.categories)
 
     REVIEW_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     log_path = REVIEW_LOG_ROOT / f"{task.id}.log"
 
     # Run reviewer synchronously — it's fast and the reconciler is already
-    # on a tick. Use `--output-format text` so we get clean output to parse.
-    with open(log_path, "wb") as log_fh:
-        proc = subprocess.run(
-            ["claude", "-p", framed,
-             "--permission-mode", "bypassPermissions",
-             "--output-format", "text"],
-            stdout=subprocess.PIPE,
-            stderr=log_fh,
-            timeout=300,
-        )
-    output = proc.stdout.decode("utf-8", errors="replace")
-    # Also write stdout to the log for debugging
-    with open(log_path, "ab") as f:
-        f.write(b"\n===== STDOUT =====\n")
-        f.write(output.encode("utf-8", errors="replace"))
+    # on a tick. One retry on failure/timeout (common causes: transient
+    # auth refresh, rate-limit blip, gh API flake).
+    attempt = 0
+    last_error = None
+    output = ""
+    while attempt < 2:
+        attempt += 1
+        try:
+            with open(log_path, "wb") as log_fh:
+                proc = subprocess.run(
+                    ["claude", "-p", framed,
+                     "--permission-mode", "bypassPermissions",
+                     "--output-format", "text"],
+                    stdout=subprocess.PIPE,
+                    stderr=log_fh,
+                    timeout=300,
+                )
+            output = proc.stdout.decode("utf-8", errors="replace")
+            with open(log_path, "ab") as f:
+                f.write(f"\n===== STDOUT (attempt {attempt}) =====\n".encode())
+                f.write(output.encode("utf-8", errors="replace"))
+            if proc.returncode == 0:
+                break
+            last_error = f"claude exited rc={proc.returncode} on attempt {attempt}"
+        except subprocess.TimeoutExpired:
+            last_error = f"claude timed out (300s) on attempt {attempt}"
+            with open(log_path, "ab") as f:
+                f.write(f"\n===== TIMEOUT on attempt {attempt} =====\n".encode())
 
-    if proc.returncode != 0:
+    if not output:
         return {
             "verdict": "error",
-            "error": f"claude exited rc={proc.returncode}",
+            "error": last_error or "no output from reviewer",
             "log": str(log_path),
         }
 
@@ -215,6 +256,26 @@ def review_pr(task: Task, cfg: ReviewConfig) -> dict:
     verdict["verdict"] = v
     verdict.setdefault("issues", [])
     verdict.setdefault("summary", "")
+
+    # Conservative policy: truncated diffs can't be cleanly "clean" —
+    # the reviewer literally didn't see all of it. Downgrade to warnings
+    # (honor `critical` though; the reviewer found something concrete).
+    if was_truncated and v == "clean":
+        verdict["verdict"] = "warnings"
+        verdict["issues"] = list(verdict.get("issues", [])) + [{
+            "category": "dead_code",
+            "severity": "warning",
+            "file": None,
+            "line": None,
+            "message": (
+                f"Diff was truncated from {len(diff):,} bytes to "
+                f"{DIFF_HEAD_BYTES + DIFF_TAIL_BYTES:,} bytes (head + tail). "
+                "Reviewer saw both ends but not the middle. Verdict "
+                "downgraded from 'clean' to 'warnings' as a safety "
+                "default — human should spot-check the unreviewed region."
+            ),
+        }]
+        verdict["truncated"] = True
 
     return verdict
 
