@@ -141,7 +141,7 @@ def init_run(
     with _exclusive_lock():
         if STATE_PATH.exists():
             raise RuntimeError(
-                f"{STATE_PATH} already exists. Run `legion stop --force` to clear."
+                f"{STATE_PATH} already exists. `rm -rf .legion/` to start fresh."
             )
         state = RunState(
             repo_url=repo_url,
@@ -149,8 +149,8 @@ def init_run(
             started_at=time.time(),
             tasks={t.id: t for t in tasks},
         )
-        _write(state)
         _append_event(state, "run_init", {"task_count": len(tasks)})
+        _write(state)
     return state
 
 

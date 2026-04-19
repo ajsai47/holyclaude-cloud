@@ -18,23 +18,37 @@ from .config import LegionConfig
 from .state import RunState
 
 
-THROTTLE_RE = re.compile(
-    r"(rate[_ ]limit|429|too many requests|usage limit)",
-    re.IGNORECASE,
-)
+# Claude Code stream-json emits rate_limit_event with status="allowed" on every
+# call — those are NOT throttles. A real throttle shows up as:
+#   - status != "allowed" inside a rate_limit_event
+#   - a 429 HTTP response surfaced in an error event
+#   - "rate_limit_exceeded" / "usage_limit_exceeded" error text
+THROTTLE_PATTERNS = [
+    re.compile(r'"rate_limit_event"[^{]{0,50}"status"\s*:\s*"(?!allowed")[a-z_]+"', re.IGNORECASE),
+    re.compile(r'"status"\s*:\s*"(throttled|rate_limited|exceeded|blocked)"', re.IGNORECASE),
+    re.compile(r'rate[_ ]limit[_ ]exceeded', re.IGNORECASE),
+    re.compile(r'usage[_ ]limit[_ ]exceeded', re.IGNORECASE),
+    re.compile(r'too many requests', re.IGNORECASE),
+    re.compile(r'"(status|code)"\s*:\s*429\b'),
+]
 
 THROTTLE_BACKOFF_SECONDS = 10 * 60  # 10 min
 
 
 def scan_worker_log_for_throttle(log_path: Path) -> bool:
-    """Return True if a worker's transcript shows a 429-ish pattern."""
+    """Return True if a worker's transcript shows a REAL 429-ish pattern.
+
+    Deliberately conservative: claude-code emits rate_limit_event with
+    status="allowed" on every turn — those are not throttles and we ignore
+    them. Only flag when something actually tripped the limit.
+    """
     if not log_path.exists():
         return False
     try:
         text = log_path.read_text(errors="replace")
     except Exception:
         return False
-    return bool(THROTTLE_RE.search(text))
+    return any(p.search(text) for p in THROTTLE_PATTERNS)
 
 
 def record_throttle(state: RunState) -> None:

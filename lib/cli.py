@@ -211,7 +211,7 @@ def cmd_poll(_args) -> int:
 
     in_flight = state.in_flight_tasks(s2)
     for task in in_flight:
-        result = dispatch.poll(task)
+        result = dispatch.poll(task, s2.base_branch)
         if result is None:
             continue
         new_status = result.get("status", "failed")

@@ -70,22 +70,45 @@ def frame_prompt(task: Task, base_branch: str, branch_name: str) -> str:
 
 def spawn_local(task: Task, base_branch: str, branch_prefix: str) -> dict:
     """Fire off a local `claude -p` in a git worktree. Returns spawn metadata."""
+    from shutil import which
+    if not which("claude"):
+        return {
+            "target": "local",
+            "worker_id": None,
+            "spawn_error": "`claude` CLI not found on PATH. Install: npm i -g @anthropic-ai/claude-code",
+            "dispatched_at": time.time(),
+        }
+    if not which("gh"):
+        return {
+            "target": "local",
+            "worker_id": None,
+            "spawn_error": "`gh` CLI not found on PATH. Install: brew install gh (or apt install gh)",
+            "dispatched_at": time.time(),
+        }
+
     branch_name = f"{branch_prefix}{task.id}"
     worktree = WORKTREE_ROOT / task.id
     worktree.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure the base branch is up to date, then make the worktree.
+    # Prune dangling worktree registrations (e.g. after `rm -rf .legion`).
+    subprocess.run(["git", "worktree", "prune"], check=False, capture_output=True)
+
     if not worktree.exists():
-        # git worktree add <path> -b <branch> <base>
-        subprocess.run(
+        create = subprocess.run(
             ["git", "worktree", "add", "-B", branch_name, str(worktree), base_branch],
-            check=True, capture_output=True,
+            capture_output=True, text=True,
         )
+        if create.returncode != 0:
+            return {
+                "target": "local",
+                "worker_id": None,
+                "spawn_error": f"git worktree add failed: {create.stderr.strip()}",
+                "dispatched_at": time.time(),
+            }
     else:
-        # Worktree exists (re-run of same task-id); refresh it.
+        # Re-run of same task-id; refresh.
         subprocess.run(["git", "fetch", "origin", base_branch], cwd=worktree, check=False)
-        subprocess.run(["git", "checkout", branch_name], cwd=worktree, check=True)
-        subprocess.run(["git", "reset", "--hard", f"origin/{base_branch}"], cwd=worktree, check=False)
+        subprocess.run(["git", "checkout", "-B", branch_name, base_branch], cwd=worktree, check=False)
 
     LOCAL_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     log_path = LOCAL_LOG_ROOT / f"{task.id}.log"
@@ -115,81 +138,85 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str) -> dict:
     }
 
 
-def poll_local(task: Task) -> dict | None:
-    """Check if the local subprocess has exited. Returns status dict or None if still running."""
+def poll_local(task: Task, base_branch: str) -> dict | None:
+    """Check if the local subprocess has exited. None if still running.
+
+    On exit: inspect worktree, handle commit/push/PR, return terminal status.
+    All git/gh calls are `check=False` so a failure surfaces as a status
+    dict rather than crashing the poll loop.
+    """
     if not task.worker_id or not task.worker_id.startswith("pid:"):
         return None
     pid = int(task.worker_id.split(":", 1)[1])
     try:
-        os.kill(pid, 0)  # signal 0 = check existence without sending
-        return None      # still running
+        os.kill(pid, 0)
+        return None  # still running
     except ProcessLookupError:
-        # Process gone. Reap via /proc or just report done — we don't have exit code.
-        # Use `wait` on a best-effort basis via waitpid(pid, WNOHANG).
-        pass
+        pass  # done
 
-    # Process is done. We need to figure out what happened.
-    # Check the worktree for diff; handle commit + push + PR.
-    branch = task.branch
+    branch = task.branch or ""
     worktree = WORKTREE_ROOT / task.id
     if not worktree.exists():
         return {"status": "failed", "error": "worktree disappeared"}
 
-    # Did claude leave a blocker?
+    def _run(argv, **kw):
+        return subprocess.run(argv, cwd=worktree, capture_output=True, text=True, **kw)
+
+    # Blocker marker?
     blocker_path = Path(f".legion/blockers/{task.id}.md")
     if blocker_path.exists():
         return {"status": "failed", "error": f"blocker: see {blocker_path}"}
 
-    # Did claude produce any diff?
-    diff_check = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree, capture_output=True, text=True,
+    # Claude made uncommitted changes?
+    diff_check = _run(["git", "status", "--porcelain"])
+    has_uncommitted = bool(diff_check.stdout.strip())
+
+    # Claude made commits on its own?
+    commits_ahead_proc = _run(
+        ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"]
     )
-    if not diff_check.stdout.strip():
-        # Also check: did claude commit something directly?
-        commits_ahead = subprocess.run(
-            ["git", "rev-list", "--count", f"origin/{task.branch or 'HEAD'}..HEAD"],
-            cwd=worktree, capture_output=True, text=True,
-        )
-        try:
-            ahead = int(commits_ahead.stdout.strip() or "0")
-        except ValueError:
-            ahead = 0
-        if ahead == 0:
-            return {"status": "no_changes"}
+    try:
+        commits_ahead = int((commits_ahead_proc.stdout or "0").strip())
+    except ValueError:
+        commits_ahead = 0
 
-    # Commit anything uncommitted, push, open PR.
-    if diff_check.stdout.strip():
-        subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", f"{task.id}: {task.title}"],
-            cwd=worktree, check=True,
-        )
+    if not has_uncommitted and commits_ahead == 0:
+        return {"status": "no_changes"}
 
-    subprocess.run(
-        ["git", "push", "-u", "origin", branch, "--force-with-lease"],
-        cwd=worktree, check=True,
-    )
+    # Commit anything uncommitted
+    if has_uncommitted:
+        add = _run(["git", "add", "-A"])
+        if add.returncode != 0:
+            return {"status": "failed", "error": f"git add: {add.stderr}"}
+        commit = _run(["git", "commit", "-m", f"{task.id}: {task.title}"])
+        if commit.returncode != 0:
+            return {"status": "failed", "error": f"git commit: {commit.stderr}"}
 
-    # Open PR
+    # Push
+    push = _run(["git", "push", "-u", "origin", branch, "--force-with-lease"])
+    if push.returncode != 0:
+        return {"status": "failed", "error": f"git push: {push.stderr}"}
+
+    # Open PR (against the actual base branch)
     pr_body = (
         f"{task.spec}\n\n---\n<!-- legion-task-id: {task.id} -->\n"
         f"Spawned by HolyClaude Legion (local worker).\n"
     )
-    pr_result = subprocess.run(
-        ["gh", "pr", "create",
-         "--base", "HEAD",  # orchestrator fills in real base via worktree
-         "--head", branch,
-         "--title", f"{task.id}: {task.title}",
-         "--body", pr_body],
-        cwd=worktree, capture_output=True, text=True,
-    )
-    pr_url = pr_result.stdout.strip() if pr_result.returncode == 0 else None
+    pr_result = _run([
+        "gh", "pr", "create",
+        "--base", base_branch,
+        "--head", branch,
+        "--title", f"{task.id}: {task.title}",
+        "--body", pr_body,
+    ])
+    if pr_result.returncode != 0:
+        # Common case: PR already exists (re-run of same task-id). Fetch its URL.
+        existing = _run(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"])
+        if existing.returncode == 0 and existing.stdout.strip():
+            return {"status": "shipped", "pr_url": existing.stdout.strip()}
+        return {"status": "pushed_no_pr", "error": f"gh pr create: {pr_result.stderr}"}
 
-    return {
-        "status": "shipped" if pr_url else "pushed_no_pr",
-        "pr_url": pr_url,
-    }
+    return {"status": "shipped", "pr_url": pr_result.stdout.strip()}
 
 
 def kill_local(task: Task, signal_num: int = 15) -> bool:
@@ -239,15 +266,13 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str)
         }
 
     # Parse FunctionCall ID out of the modal output.
-    # modal prints something like: "Function call fc-XXXXX is running detached..."
+    # modal CLI emits something like "fc-Abc123XYZ...". Match liberally.
+    import re as _re
     call_id = None
-    for line in result.stdout.splitlines():
-        if "fc-" in line:
-            for tok in line.split():
-                if tok.startswith("fc-"):
-                    call_id = tok.rstrip(",.")
-                    break
-        if call_id:
+    for source in (result.stdout, result.stderr):
+        match = _re.search(r"\bfc-[a-zA-Z0-9]+\b", source or "")
+        if match:
+            call_id = match.group(0)
             break
 
     return {
@@ -308,9 +333,9 @@ def spawn(task: Task, target: str, repo_url: str, base_branch: str, branch_prefi
     raise ValueError(f"unknown target {target!r}")
 
 
-def poll(task: Task) -> dict | None:
+def poll(task: Task, base_branch: str) -> dict | None:
     if task.target == "local":
-        return poll_local(task)
+        return poll_local(task, base_branch)
     if task.target == "cloud":
         return poll_cloud(task)
     return None
