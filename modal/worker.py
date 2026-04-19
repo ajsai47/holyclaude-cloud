@@ -31,7 +31,72 @@ from pathlib import Path
 
 import modal
 
-from image import image, shared_brain, worker_cache, SECRETS
+
+# ======================================================================
+# Image — inlined from image.py. Modal doesn't ship sibling .py files
+# in the image by default; keeping the image definition and function in
+# a single file avoids ModuleNotFoundError inside the container.
+# See image.py for the documented, canonical definition.
+# ======================================================================
+
+HOLYCLAUDE_REPO = "https://github.com/ajsai47/holyclaude.git"
+HOLYCLAUDE_REF = "main"
+NODE_MAJOR = "20"
+PLAYWRIGHT_VERSION = "1.48.0"
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "curl", "git", "ca-certificates", "gnupg", "build-essential",
+        "unzip", "jq",
+        "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2",
+        "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1",
+        "libxrandr2", "libgbm1", "libpango-1.0-0", "libcairo2", "libasound2",
+    )
+    .run_commands(
+        f"curl -fsSL https://deb.nodesource.com/setup_{NODE_MAJOR}.x | bash -",
+        "apt-get install -y nodejs",
+    )
+    .run_commands("npm install -g @anthropic-ai/claude-code")
+    .run_commands(
+        "curl -fsSL https://bun.sh/install | bash",
+        "ln -s /root/.bun/bin/bun /usr/local/bin/bun",
+    )
+    .pip_install(
+        "tomli==2.0.2",
+        "httpx==0.27.2",
+        "rich==13.9.4",
+    )
+    .run_commands(
+        f"git clone {HOLYCLAUDE_REPO} /opt/holyclaude",
+        f"cd /opt/holyclaude && git checkout {HOLYCLAUDE_REF}",
+        "cd /opt/holyclaude && bun install --frozen-lockfile || bun install || true",
+    )
+    .run_commands(
+        f"npm install -g playwright@{PLAYWRIGHT_VERSION}",
+        "npx playwright install chromium --with-deps",
+    )
+    .run_commands(
+        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | "
+        "  dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg",
+        "chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg",
+        'echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] '
+        'https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list',
+        "apt-get update",
+        "apt-get install -y gh",
+    )
+)
+
+SHARED_BRAIN_VOLUME = "holyclaude-cloud-shared-brain"
+WORKER_CACHE_VOLUME = "holyclaude-cloud-worker-cache"
+
+shared_brain = modal.Volume.from_name(SHARED_BRAIN_VOLUME, create_if_missing=True)
+worker_cache = modal.Volume.from_name(WORKER_CACHE_VOLUME, create_if_missing=True)
+
+SECRETS = [
+    modal.Secret.from_name("claude-pro-session"),
+    modal.Secret.from_name("legion-github"),
+]
 
 
 app = modal.App("holyclaude-cloud-worker")

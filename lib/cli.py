@@ -397,6 +397,68 @@ def cmd_cap(_args) -> int:
 
 
 # ----------------------------------------------------------------------
+# cleanup (idempotent reset)
+# ----------------------------------------------------------------------
+
+def cmd_cleanup(args) -> int:
+    """Remove worktrees, delete legion/* branches, and (optionally) .legion/.
+
+    Safe to run any time. Does NOT touch shipped PRs or the base branch.
+    """
+    removed_worktrees = []
+    deleted_branches = []
+
+    # 1. Find legion worktrees and remove them
+    wt_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    for block in wt_list.stdout.split("\n\n"):
+        for line in block.splitlines():
+            if line.startswith("worktree ") and "/.legion/worktrees/" in line:
+                path = line.split(" ", 1)[1]
+                r = subprocess.run(
+                    ["git", "worktree", "remove", "--force", path],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    removed_worktrees.append(path)
+    subprocess.run(["git", "worktree", "prune"], check=False, capture_output=True)
+
+    # 2. Find and delete any legion/* branches
+    branches = subprocess.run(
+        ["git", "branch", "--list", "legion/*"],
+        capture_output=True, text=True,
+    )
+    for line in branches.stdout.splitlines():
+        b = line.strip().lstrip("* ").strip()
+        if not b:
+            continue
+        r = subprocess.run(
+            ["git", "branch", "-D", b],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            deleted_branches.append(b)
+
+    # 3. Optionally wipe .legion/
+    wiped_legion_dir = False
+    if args.all:
+        import shutil
+        legion_dir = Path(".legion")
+        if legion_dir.exists():
+            shutil.rmtree(legion_dir)
+            wiped_legion_dir = True
+
+    print(json.dumps({
+        "removed_worktrees": removed_worktrees,
+        "deleted_branches": deleted_branches,
+        "wiped_legion_dir": wiped_legion_dir,
+    }, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
 # Entry
 # ----------------------------------------------------------------------
 
@@ -442,6 +504,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_cap = sub.add_parser("cap")
     p_cap.set_defaults(func=cmd_cap)
+
+    p_clean = sub.add_parser("cleanup", help="Remove legion worktrees + branches")
+    p_clean.add_argument("--all", action="store_true",
+                         help="Also rm -rf .legion/ (wipes run state)")
+    p_clean.set_defaults(func=cmd_cleanup)
 
     args = p.parse_args(argv)
     return args.func(args)
