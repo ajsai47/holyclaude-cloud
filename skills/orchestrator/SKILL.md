@@ -68,11 +68,28 @@ Constraints:
 
 ---
 
-## Step 3 — Init
+## Step 3a — Refine the decomposition (Phase 5a)
+
+Before committing to the DAG, let the critic+refiner loop audit it:
 
 ```bash
 mkdir -p .legion
 # write the tasks.json you produced above
+~/holyclaude-cloud/bin/legion decompose-refine .legion/tasks.json --goal "<original goal>" --iterations 3
+```
+
+This runs deterministic checks (file-overlap between siblings, dep cycles, orphan deps, weak specs, oversized tasks) + one LLM critique per iteration. If it finds issues and can improve the graph, it rewrites `.legion/tasks.json` in place (the original is saved to `.legion/tasks.json.pre-refine`). Up to `--iterations` rounds, or stops early when stable.
+
+The output tells you:
+- `status: "refined"` — the graph changed; show the user the diff
+- `status: "stable"` — no issues found; original was fine
+- `status: "no_refinement"` — flags exist but critic didn't produce a revision (rare; surface flags to user)
+
+Show the user the before/after diff (if refined) and surface any remaining flags. If there are CRITICAL flags even after refinement: stop and ask the user whether to override or abort.
+
+## Step 3b — Init
+
+```bash
 ~/holyclaude-cloud/bin/legion init .legion/tasks.json
 ```
 
@@ -144,6 +161,10 @@ Read the final summary. Surface to the user:
 ## Subcommand reference
 
 ```
+legion critique <tasks.json> [--goal G]          # critic only, no changes
+legion decompose-refine <tasks.json> [--goal G]  # critic + refiner loop
+                                                 # up to --iterations (default 3),
+                                                 # rewrites in place
 legion init <tasks.json> [--repo-url URL] [--base-branch BR]
 legion run [--tick-seconds N] [--max-ticks M] [--quiet]
 legion ready                 # JSON list of ready task IDs
@@ -156,6 +177,7 @@ legion scale <n|auto>        # override max_workers, 'auto' to clear
 legion cost                  # usage summary
 legion reconcile             # one idempotent merge pass
 legion mediate <task-id>     # force a mediator run
+legion review <task-id>      # force a reviewer run on a PR
 legion stop [--graceful|--force]
 legion cleanup [--all]
 ```

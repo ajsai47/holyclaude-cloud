@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import dispatch, governor, mediator, reconciler, reviewer, routing, state
+from . import critic, dispatch, governor, mediator, reconciler, reviewer, routing, state
 from .config import load as load_config
 
 
@@ -731,6 +731,60 @@ def cmd_mediate(args) -> int:
 
 
 # ----------------------------------------------------------------------
+# critique / refine — decomposition subgraph (Phase 5a)
+# ----------------------------------------------------------------------
+
+def cmd_critique(args) -> int:
+    """Run deterministic + LLM critique on a tasks.json without modifying it."""
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        print(f"error: {tasks_path} not found", file=sys.stderr)
+        return 1
+    tasks = json.loads(tasks_path.read_text())
+    goal = args.goal or "(not provided)"
+    result = critic.critique_and_refine(tasks, goal)
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0
+
+
+def cmd_decompose_refine(args) -> int:
+    """Iterate critic + refiner up to --iterations times. Overwrites the tasks file."""
+    tasks_path = Path(args.tasks)
+    if not tasks_path.exists():
+        print(f"error: {tasks_path} not found", file=sys.stderr)
+        return 1
+    tasks = json.loads(tasks_path.read_text())
+    goal = args.goal or "(not provided)"
+
+    if args.dry_run:
+        result = critic.iterate_until_stable(tasks, goal, max_iterations=args.iterations)
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    result = critic.iterate_until_stable(tasks, goal, max_iterations=args.iterations)
+    if result.refined_tasks:
+        # Backup the original
+        backup = tasks_path.with_suffix(".json.pre-refine")
+        backup.write_text(tasks_path.read_text())
+        tasks_path.write_text(json.dumps(result.refined_tasks, indent=2))
+        print(json.dumps({
+            "status": "refined",
+            "iterations": result.iterations,
+            "remaining_flag_count": len(result.flags),
+            "summary": result.llm_summary,
+            "backup": str(backup),
+        }, indent=2))
+    else:
+        print(json.dumps({
+            "status": "stable" if result.converged else "no_refinement",
+            "iterations": result.iterations,
+            "flag_count": len(result.flags),
+            "summary": result.llm_summary,
+        }, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
 # run — autonomous dispatch + reconcile loop
 # ----------------------------------------------------------------------
 
@@ -1027,6 +1081,21 @@ def main(argv: list[str] | None = None) -> int:
                        help="Max ticks before exit (default 0 = unlimited)")
     p_run.add_argument("--quiet", action="store_true")
     p_run.set_defaults(func=cmd_run)
+
+    p_crit = sub.add_parser("critique",
+                            help="Run deterministic+LLM critique on a tasks.json (no changes)")
+    p_crit.add_argument("tasks", help="Path to tasks.json")
+    p_crit.add_argument("--goal", default=None)
+    p_crit.set_defaults(func=cmd_critique)
+
+    p_ref = sub.add_parser("decompose-refine",
+                           help="Iterate critique + refine up to --iterations times; overwrites the file")
+    p_ref.add_argument("tasks", help="Path to tasks.json")
+    p_ref.add_argument("--goal", default=None)
+    p_ref.add_argument("--iterations", type=int, default=3)
+    p_ref.add_argument("--dry-run", action="store_true",
+                       help="Don't overwrite; just print the result")
+    p_ref.set_defaults(func=cmd_decompose_refine)
 
     p_cost = sub.add_parser("cost")
     p_cost.set_defaults(func=cmd_cost)

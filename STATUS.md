@@ -106,11 +106,33 @@ See PLAN.md for the strategic framing.
 Example reviewer comment from the live test (PR #20):
 > SQL injection: username is interpolated directly into the query string via an f-string. Any caller-controlled username value can terminate the string literal and inject arbitrary SQL (e.g. ' OR '1'='1). Must use a parameterized query.
 
-## Phase 5a — Decomposition subgraph (next)
+## Phase 5a — Decomposition subgraph  ✅ shipped (v1)
 
-See PLAN.md. Decomposer → Critic → Refiner loop, codebase-aware (tree-sitter
-scan of files_touched), brain-informed (query past retros), model-tier
-routing (Haiku/Sonnet/Opus per task).
+Critic + Refiner loop that audits proposed task DAGs before dispatch.
+Catches obvious problems (file conflicts between siblings, dep cycles,
+weak specs, oversized tasks) with deterministic Python checks PLUS
+qualitative issues (ambiguous specs, scope drift, missing tests,
+under-parallelization) via a Claude LLM call.
+
+- [x] `lib/critic.py` — deterministic checks + LLM critique + refiner,
+      combined into `critique_and_refine()` + `iterate_until_stable()`
+- [x] CLI: `legion critique <tasks.json>` (read-only) and
+      `legion decompose-refine <tasks.json>` (iterates + rewrites in place)
+- [x] Orchestrator skill updated: inserts step 3a ("refine the
+      decomposition") between decompose and init
+- [x] Live-tested on a deliberately-bad DAG:
+      - T-A + T-B both touch config.py with no dep → file_overlap flag
+      - T-C has spec="fix it" → weak_spec + ambiguous_spec flags
+      - T-C at 90 min → oversized + scope_drift flags
+      - Refiner produced a clean 4-task DAG: serialized T-A→T-B, rescoped
+        T-C to "wire flags to CLI", added T-D for tests.
+
+Deferred to Phase 5a-v2:
+- [ ] Model-tier routing (Haiku/Sonnet/Opus per task) — bundled with 5a
+      in PLAN.md but separable; task complexity → model selection
+- [ ] Codebase-aware critique — tree-sitter/grep-inform the critic about
+      file existence, test conventions, style guides
+- [ ] Brain-informed critique — query past retros via 5c (requires 5c first)
 
 ## Phase 5c — Learning brain
 
