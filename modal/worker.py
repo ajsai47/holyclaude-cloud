@@ -272,6 +272,9 @@ def _run_task_body(
     ]
     step(f"running claude -p ({len(framed_prompt)} chars of prompt)")
 
+    # Modal containers run as root. Claude Code refuses to bypass permissions
+    # when UID=0 unless IS_SANDBOX=1 is set to acknowledge the environment.
+    claude_env = {**os.environ, "IS_SANDBOX": "1"}
     proc = subprocess.Popen(
         cmd,
         cwd=WORKSPACE,
@@ -279,6 +282,7 @@ def _run_task_body(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=claude_env,
     )
     transcript = []
     assert proc.stdout is not None
