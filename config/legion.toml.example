@@ -42,6 +42,29 @@ github_repo = ""
 # Branch prefix for legion-spawned branches.
 branch_prefix = "legion/"
 
+[review]
+# Run an independent reviewer on each shipped PR before merging.
+# - "critical" verdict blocks merge and re-dispatches the task
+#   (up to max_review_redispatches, with feedback appended to the spec)
+# - "warnings" verdict merges but posts issues as a PR comment
+# - "clean" verdict merges silently
+enabled = true
+
+# Categories the reviewer checks for
+categories = ["security", "task_adherence", "silent_failures", "type_design", "dead_code"]
+
+# Max re-dispatches on critical verdict before giving up and blocking
+# the merge for human review
+max_review_redispatches = 2
+
+# Where to run reviewer workers:
+#   "local" (default) — fast, free with Pro session, uses whatever Claude
+#                       Code is installed locally
+#   "cloud"           — runs in Modal container, slower, uses same auth as
+#                       regular cloud workers
+#   "auto"            — same router heuristics as regular workers
+target = "local"
+
 [dispatch]
 # Heuristics router uses for local-vs-cloud routing. The router is an Opus call
 # that takes these as priors. Tweak to bias.

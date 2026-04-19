@@ -34,6 +34,22 @@ class ReconcilerConfig:
 
 
 @dataclass
+class ReviewConfig:
+    enabled: bool = True
+    categories: list[str] = field(default_factory=lambda: [
+        "security",
+        "task_adherence",
+        "silent_failures",
+        "type_design",
+        "dead_code",
+    ])
+    max_review_redispatches: int = 2
+    # Where to run the reviewer: "local" | "cloud" | "auto"
+    # "auto" = same router as regular workers
+    target: str = "local"
+
+
+@dataclass
 class DispatchConfig:
     local_file_threshold: int = 5
     cloud_minutes_threshold: int = 5
@@ -51,6 +67,7 @@ class LegionConfig:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     reconciler: ReconcilerConfig = field(default_factory=ReconcilerConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
 
 
 def load(path: Path = CONFIG_PATH) -> LegionConfig:
@@ -70,4 +87,5 @@ def load(path: Path = CONFIG_PATH) -> LegionConfig:
         budget=BudgetConfig(**raw.get("budget", {})),
         reconciler=ReconcilerConfig(**raw.get("reconciler", {})),
         dispatch=DispatchConfig(**raw.get("dispatch", {})),
+        review=ReviewConfig(**raw.get("review", {})),
     )

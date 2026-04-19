@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import dispatch, governor, mediator, reconciler, routing, state
+from . import dispatch, governor, mediator, reconciler, reviewer, routing, state
 from .config import load as load_config
 
 
@@ -502,6 +502,111 @@ def cmd_reconcile(args) -> int:
                 results.append({"task_id": task.id, "status": "ci_failed_max_retries"})
             continue
 
+        # 1b. Pre-merge review gate (Phase 5b)
+        if cfg.review.enabled and task.review_verdict != "clean" and task.review_verdict != "warnings":
+            rv = reviewer.review_pr(task, cfg.review)
+            verdict = rv.get("verdict", "error")
+
+            if verdict == "error":
+                # Reviewer itself failed — log and proceed to merge this tick.
+                # Don't block on reviewer flakiness; next tick will retry.
+                results.append({
+                    "task_id": task.id,
+                    "status": "review_errored",
+                    "detail": rv.get("error", ""),
+                    "log": rv.get("log", ""),
+                })
+                # Fall through to merge below
+
+            elif verdict == "critical":
+                # Block merge + potentially re-dispatch
+                issues = rv.get("issues", [])
+                summary = rv.get("summary", "")
+                if task.review_attempts < cfg.review.max_review_redispatches:
+                    # Re-dispatch with review feedback
+                    feedback = reviewer.format_issues_for_spec(issues, summary)
+                    def _redispatch(run: state.RunState, tid=task.id, fb=feedback,
+                                    iss=issues, summ=summary):
+                        t = run.tasks[tid]
+                        t.status = "pending"
+                        t.review_attempts += 1
+                        t.review_verdict = None       # clear for re-review next time
+                        t.review_issues = iss
+                        t.review_summary = summ
+                        t.spec = t.spec + fb
+                        t.worker_id = None
+                        t.branch = None
+                        t.pr_url = None
+                        t.dispatched_at = None
+                        t.finished_at = None
+                        t.error = None
+                        run.events.append({
+                            "ts": time.time(), "kind": "review_redispatch",
+                            "task_id": tid, "attempt": t.review_attempts,
+                            "issue_count": len(iss),
+                        })
+                    state.update_state(_redispatch)
+                    # Also post a comment on the old PR explaining
+                    if task.pr_url:
+                        reviewer.post_pr_comment(
+                            task.pr_url,
+                            reviewer.format_issues_for_pr_comment(issues) +
+                            "\n\n_Re-dispatching with this feedback as a new worker attempt._"
+                        )
+                    results.append({
+                        "task_id": task.id, "status": "review_critical_redispatched",
+                        "attempt": task.review_attempts + 1,
+                        "issue_count": len(issues),
+                    })
+                    continue
+                else:
+                    def _block(run: state.RunState, tid=task.id, iss=issues, summ=summary):
+                        t = run.tasks[tid]
+                        t.merge_blocker = "review_failed"
+                        t.review_verdict = "critical"
+                        t.review_issues = iss
+                        t.review_summary = summ
+                        run.events.append({
+                            "ts": time.time(), "kind": "merge_blocked",
+                            "task_id": tid, "reason": "review_failed",
+                        })
+                    state.update_state(_block)
+                    if task.pr_url:
+                        reviewer.post_pr_comment(
+                            task.pr_url,
+                            reviewer.format_issues_for_pr_comment(issues) +
+                            f"\n\n_Max review re-dispatches ({cfg.review.max_review_redispatches}) "
+                            f"exhausted — needs human resolution._"
+                        )
+                    results.append({
+                        "task_id": task.id, "status": "review_critical_maxed",
+                        "issue_count": len(issues),
+                    })
+                    continue
+
+            elif verdict == "warnings":
+                # Merge proceeds, comment the warnings on the PR
+                issues = rv.get("issues", [])
+                summary = rv.get("summary", "")
+                def _note(run: state.RunState, tid=task.id, iss=issues, summ=summary):
+                    t = run.tasks[tid]
+                    t.review_verdict = "warnings"
+                    t.review_issues = iss
+                    t.review_summary = summ
+                state.update_state(_note)
+                if issues and task.pr_url:
+                    reviewer.post_pr_comment(
+                        task.pr_url,
+                        reviewer.format_issues_for_pr_comment(issues),
+                    )
+                # Fall through to merge
+
+            else:  # clean
+                def _ok(run: state.RunState, tid=task.id):
+                    run.tasks[tid].review_verdict = "clean"
+                state.update_state(_ok)
+                # Fall through to merge
+
         # 2. Attempt merge
         mr = reconciler.merge_pr(task)
         if mr["status"] == "merged":
@@ -583,6 +688,25 @@ def cmd_reconcile(args) -> int:
 # ----------------------------------------------------------------------
 # mediate <task-id> — manually invoke the mediator
 # ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# review <task-id> — manually invoke the reviewer
+# ----------------------------------------------------------------------
+
+def cmd_review(args) -> int:
+    s = state.read_state()
+    cfg = load_config()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    if not task.pr_url:
+        print(f"error: task {task.id} has no PR to review", file=sys.stderr)
+        return 1
+    rv = reviewer.review_pr(task, cfg.review)
+    print(json.dumps(rv, indent=2))
+    return 0 if rv.get("verdict") in ("clean", "warnings") else 2
+
 
 def cmd_mediate(args) -> int:
     s = state.read_state()
@@ -926,6 +1050,10 @@ def main(argv: list[str] | None = None) -> int:
     p_med = sub.add_parser("mediate", help="Manually invoke the mediator on a task")
     p_med.add_argument("task_id")
     p_med.set_defaults(func=cmd_mediate)
+
+    p_rev = sub.add_parser("review", help="Manually invoke the reviewer on a task")
+    p_rev.add_argument("task_id")
+    p_rev.set_defaults(func=cmd_review)
 
     args = p.parse_args(argv)
     return args.func(args)

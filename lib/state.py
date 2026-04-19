@@ -67,8 +67,14 @@ class Task:
 
     # Reconciler fields
     merged_at: float | None = None
-    merge_blocker: str | None = None    # "ci_failed" | "mediator_maxed" | "needs_human"
+    merge_blocker: str | None = None    # "ci_failed" | "mediator_maxed" | "review_failed" | "needs_human"
     mediator_attempts: int = 0
+
+    # Reviewer fields (Phase 5b)
+    review_verdict: str | None = None   # "clean" | "warnings" | "critical"
+    review_issues: list[dict] = field(default_factory=list)
+    review_summary: str | None = None
+    review_attempts: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

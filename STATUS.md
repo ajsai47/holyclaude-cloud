@@ -79,7 +79,45 @@ Real working code for concurrent dispatch, atomic state, throttle-aware cap.
       all interleaved automatically. PRs #17, #18, #19 merged, final repo
       state correct (C imports from A and B).
 
-## Phase 5 — deferred (lower priority)
+## Phase 5b — Pre-merge review gate  ✅ shipped
+
+See PLAN.md for the strategic framing.
+
+- [x] `lib/reviewer.py` — adversarial reviewer worker: fetches PR diff,
+      frames Claude with strict JSON verdict output, parses
+      clean/warnings/critical + list of issues
+- [x] Task state extensions: `review_verdict`, `review_issues`,
+      `review_summary`, `review_attempts`
+- [x] `[review]` config section in `legion.toml`: enabled, categories,
+      max_review_redispatches, target
+- [x] Reconciler hooks review between CI check and merge. Flow:
+      - `critical` → re-dispatch task with issues appended to spec
+        (up to `max_review_redispatches`); post PR comment with issue list
+      - `warnings` → merge proceeds, issues posted as PR comment
+      - `clean`    → merge silently
+- [x] `legion review <task-id>` CLI subcommand for manual re-review
+- [x] **Live-validated on deliberately-insecure task**: worker wrote
+      `f"...WHERE username = '{username}'"` (real SQL injection) per a
+      deliberately-bad spec. Reviewer caught it critical, re-dispatched
+      with security feedback. Second worker produced parameterized query
+      (safe). Reviewer on second attempt flagged spec-adherence warning
+      but merged. Final merged code is safe despite unsafe spec.
+
+Example reviewer comment from the live test (PR #20):
+> SQL injection: username is interpolated directly into the query string via an f-string. Any caller-controlled username value can terminate the string literal and inject arbitrary SQL (e.g. ' OR '1'='1). Must use a parameterized query.
+
+## Phase 5a — Decomposition subgraph (next)
+
+See PLAN.md. Decomposer → Critic → Refiner loop, codebase-aware (tree-sitter
+scan of files_touched), brain-informed (query past retros), model-tier
+routing (Haiku/Sonnet/Opus per task).
+
+## Phase 5c — Learning brain
+
+See PLAN.md. Structured retrospectives after every task, decomposer +
+workers query the brain before starting.
+
+## Deferred (lower priority)
 
 - [ ] Real Modal billing API integration in `legion cost`
 - [ ] Per-worker repo cache (shared bare clone, `git clone --reference`)
