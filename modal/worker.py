@@ -185,14 +185,19 @@ def run_task(
     (cache_dir / "transcript.jsonl").write_text("".join(transcript))
     (cache_dir / "log.txt").write_text("\n".join(log))
 
-    if rc != 0:
+    def _emit_result(d: dict) -> dict:
+        """Write result.json to the cache volume so poll_cloud can pull it."""
+        (cache_dir / "result.json").write_text(json.dumps(d, indent=2))
         worker_cache.commit()
-        return {
+        return d
+
+    if rc != 0:
+        return _emit_result({
             "task_id": task_id,
             "status": "claude_failed",
             "returncode": rc,
             "elapsed_s": time.perf_counter() - t_start,
-        }
+        })
 
     # ---------------------------------------------------------------
     # 5. Commit + push + open PR
@@ -204,12 +209,11 @@ def run_task(
     )
     if not diff_check.stdout.strip():
         step("no changes — claude produced no diff")
-        worker_cache.commit()
-        return {
+        return _emit_result({
             "task_id": task_id,
             "status": "no_changes",
             "elapsed_s": time.perf_counter() - t_start,
-        }
+        })
 
     subprocess.run(["git", "add", "-A"], cwd=WORKSPACE, check=True)
     subprocess.run(
@@ -244,16 +248,15 @@ def run_task(
     else:
         step(f"gh pr create failed: {pr_create.stderr}")
 
-    worker_cache.commit()
     shared_brain.commit()  # flush any claude-mem writes
 
-    return {
+    return _emit_result({
         "task_id": task_id,
         "status": "shipped" if pr_url else "pushed_no_pr",
         "branch": branch_name,
         "pr_url": pr_url,
         "elapsed_s": time.perf_counter() - t_start,
-    }
+    })
 
 
 @app.local_entrypoint()

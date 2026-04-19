@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# legion — thin shim to run lib.cli.
+# Called by the orchestrator skill via full path:
+#   ~/holyclaude-cloud/bin/legion <subcommand> [args]
+
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO_ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+exec env PYTHONPATH="$REPO_ROOT" python3 -m lib.cli "$@"

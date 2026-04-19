@@ -18,24 +18,19 @@ $ARGUMENTS — `--graceful` (default) or `--force`.
 
 ## Procedure
 
-1. Read `./.legion/state.json`. If missing, say "No active legion run."
+Run `~/holyclaude-cloud/bin/legion stop` with the appropriate flag.
 
-2. **Graceful** (default):
-   - Write `.legion/STOP` with the current timestamp.
-   - The orchestrator's dispatch loop checks for this file each iteration and stops dispatching new tasks.
-   - In-flight workers complete naturally and push their PRs.
-   - Print: "Stop signal sent. N workers in flight will finish; M queued tasks cancelled."
+- `--graceful` (default): writes `.legion/STOP`, orchestrator's dispatch loop drains on next poll. In-flight workers complete; queued tasks cancel.
+- `--force`: kills all in-flight workers (local SIGKILL, cloud Modal FunctionCall cancel), marks them `failed` with error `force-stopped`, writes `STOP`. PR state may be inconsistent.
 
-3. **Force**:
-   - For each in-flight cloud worker, find the Modal function call ID in `state.json`.
-   - Run: `/Users/ajsai47/tinker-env/bin/modal app stop holyclaude-cloud-worker` to terminate the whole worker app's containers.
-   - Local subagents: there's no clean kill — note them as "abandoned" in state.json.
-   - Print: "Force-killed N cloud workers. M local subagents will exit on their own. PR state may be inconsistent — check before merging."
-
-4. Either way, write the final state to `.legion/state.json` with `status: "stopped"`.
+Show the user the CLI's output and add:
+- PRs that shipped before the stop (from `legion status`)
+- Half-pushed branches after `--force` to investigate manually
 
 ---
 
 ## Note
 
-`--force` can leave half-pushed branches and partial PRs. Use `--graceful` unless something is genuinely broken.
+After a stop, the orchestrator's dispatch loop (if still running in another Claude session) will exit on its next iteration. If no dispatch loop is running (you already quit the session), `legion stop --graceful` just writes the marker — nothing will act on it until a new `/legion-start --resume` happens (Phase 4).
+
+If the run is permanently dead and you want to clear state: `rm -rf .legion/`.
