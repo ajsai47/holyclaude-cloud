@@ -125,6 +125,7 @@ def cmd_spawn(args) -> int:
         repo_url=s.repo_url,
         base_branch=s.base_branch,
         branch_prefix=cfg.reconciler.branch_prefix,
+        auth_mode=cfg.swarm.auth_mode,
     )
 
     if not meta.get("worker_id"):
@@ -303,7 +304,24 @@ def cmd_status(_args) -> int:
 # ----------------------------------------------------------------------
 
 def cmd_scale(args) -> int:
-    n = args.n
+    # Support `legion scale auto` to clear the override
+    raw = str(args.n).lower()
+    if raw in ("auto", "clear", "none"):
+        def mut(s: state.RunState):
+            s.max_workers_override = None
+            s.events.append({
+                "ts": time.time(), "kind": "scale_cleared",
+            })
+        state.update_state(mut)
+        print(json.dumps({"max_workers_override": None, "mode": "auto"}))
+        return 0
+
+    try:
+        n = int(args.n)
+    except (ValueError, TypeError):
+        print(f"error: scale value must be an integer or 'auto', got {args.n!r}", file=sys.stderr)
+        return 1
+
     def mut(s: state.RunState):
         s.max_workers_override = n
         s.events.append({
@@ -440,14 +458,48 @@ def cmd_reconcile(args) -> int:
             results.append({"task_id": task.id, "status": "ci_pending"})
             continue
         if ci == "fail":
-            def _mut(run: state.RunState, tid=task.id):
-                run.tasks[tid].merge_blocker = "ci_failed"
-                run.events.append({
-                    "ts": time.time(), "kind": "merge_blocked",
-                    "task_id": tid, "reason": "ci_failed",
+            # Re-dispatch: put the task back into pending with the CI failure
+            # attached to its spec, so the next worker has context on what broke.
+            if task.mediator_attempts < cfg.reconciler.mediator_max_retries:
+                # Use mediator_attempts as overall retry counter — reusing it
+                # avoids a new field; semantically it still caps "how many
+                # times we auto-retry this task"
+                failure_detail = reconciler.fetch_ci_failure(task.pr_url)
+                def _mut(run: state.RunState, tid=task.id, det=failure_detail):
+                    t = run.tasks[tid]
+                    t.status = "pending"
+                    t.mediator_attempts += 1
+                    # Append CI failure to the task spec so the next worker sees it
+                    t.spec = (
+                        t.spec
+                        + f"\n\n---\n## Previous attempt's CI failure (retry #{t.mediator_attempts})\n\n"
+                        + det[:2000]
+                    )
+                    # Reset worker metadata so spawn treats it as fresh
+                    t.worker_id = None
+                    t.branch = None
+                    t.pr_url = None
+                    t.dispatched_at = None
+                    t.finished_at = None
+                    t.error = None
+                    run.events.append({
+                        "ts": time.time(), "kind": "ci_redispatch",
+                        "task_id": tid, "attempt": t.mediator_attempts,
+                    })
+                state.update_state(_mut)
+                results.append({
+                    "task_id": task.id, "status": "ci_failed_redispatched",
+                    "retry_number": task.mediator_attempts + 1,
                 })
-            state.update_state(_mut)
-            results.append({"task_id": task.id, "status": "ci_failed"})
+            else:
+                def _mut(run: state.RunState, tid=task.id):
+                    run.tasks[tid].merge_blocker = "ci_failed"
+                    run.events.append({
+                        "ts": time.time(), "kind": "merge_blocked",
+                        "task_id": tid, "reason": "ci_failed",
+                    })
+                state.update_state(_mut)
+                results.append({"task_id": task.id, "status": "ci_failed_max_retries"})
             continue
 
         # 2. Attempt merge
@@ -555,6 +607,198 @@ def cmd_mediate(args) -> int:
 
 
 # ----------------------------------------------------------------------
+# run — autonomous dispatch + reconcile loop
+# ----------------------------------------------------------------------
+
+def cmd_run(args) -> int:
+    """Autonomous loop: dispatch ready tasks, poll in-flight, reconcile shipped.
+
+    Exits when:
+      - No in-flight + no ready + no shipped-but-unmerged tasks remain, OR
+      - `.legion/STOP` is written (by /legion-stop or Ctrl-C handler).
+
+    Resilient to individual spawn/poll/reconcile failures — logs the error
+    and continues the next tick.
+    """
+    import signal
+    tick_s = max(1, args.tick_seconds)
+    quiet = args.quiet
+    max_ticks = args.max_ticks or 0  # 0 = unbounded
+
+    def _say(msg: str):
+        if not quiet:
+            print(msg, flush=True)
+
+    # Handle Ctrl-C by writing STOP and letting the loop drain naturally.
+    _original_handler = signal.getsignal(signal.SIGINT)
+    def _on_sigint(_signum, _frame):
+        _say("\n[run] SIGINT — writing STOP; in-flight workers will finish")
+        state.write_stop("graceful")
+        signal.signal(signal.SIGINT, _original_handler)
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    tick = 0
+    last_status: str = ""
+
+    while True:
+        tick += 1
+        if max_ticks and tick > max_ticks:
+            _say(f"[run] hit max_ticks={max_ticks}, exiting")
+            break
+
+        stop_mode = state.stop_requested()
+
+        try:
+            s = state.read_state()
+        except Exception as e:
+            print(f"[run] read_state failed: {e}", file=sys.stderr)
+            return 1
+
+        cfg = load_config()
+        in_flight = state.in_flight_tasks(s)
+        ready = state.ready_tasks(s)
+        unmerged_shipped = [
+            t for t in s.tasks.values()
+            if t.status == "shipped" and t.merged_at is None and t.merge_blocker is None
+        ]
+
+        # ---- Exit condition ----
+        if not in_flight and not ready and not unmerged_shipped:
+            _say(f"[run] done at tick {tick}")
+            break
+
+        if stop_mode == "graceful" and not in_flight and not unmerged_shipped:
+            _say(f"[run] graceful stop reached (no in-flight)")
+            break
+
+        if stop_mode == "force":
+            _say(f"[run] force stop — exiting immediately")
+            break
+
+        # ---- Reap stale workers ----
+        stale_ids = governor.stale_in_flight(s, cfg)
+        for stale_id in stale_ids:
+            stale_task = s.tasks[stale_id]
+            _say(f"[run] reaping stale worker {stale_id} (in-flight > {cfg.budget.worker_timeout_minutes}m)")
+            try:
+                dispatch.kill(stale_task, force=True)
+            except Exception as e:
+                _say(f"[run]   kill failed: {e}")
+            def _stale_mut(run: state.RunState, tid=stale_id):
+                t = run.tasks[tid]
+                t.status = "failed"
+                t.finished_at = time.time()
+                t.error = f"timed out after {cfg.budget.worker_timeout_minutes} minutes"
+                run.events.append({
+                    "ts": time.time(), "kind": "stale_reaped", "task_id": tid,
+                })
+            state.update_state(_stale_mut)
+
+        # ---- Poll in-flight ----
+        if in_flight:
+            try:
+                cmd_poll(argparse.Namespace()) if False else _silent_poll(s)
+            except Exception as e:
+                print(f"[run] poll error: {e}", file=sys.stderr)
+
+        # ---- Reconcile shipped ----
+        if unmerged_shipped:
+            try:
+                _silent_reconcile()
+            except Exception as e:
+                print(f"[run] reconcile error: {e}", file=sys.stderr)
+
+        # ---- Spawn up to cap ----
+        if not stop_mode:
+            s = state.read_state()
+            cap = governor.current_max_workers(s, cfg)
+            slots = max(0, cap - len(state.in_flight_tasks(s)))
+            ready = state.ready_tasks(s)
+            spawned_this_tick = 0
+            for task in ready[:slots]:
+                try:
+                    meta = dispatch.spawn(
+                        task,
+                        target=routing.route(task, cfg.dispatch, governor.throttle_active(s)).target,
+                        repo_url=s.repo_url,
+                        base_branch=s.base_branch,
+                        branch_prefix=cfg.reconciler.branch_prefix,
+                        auth_mode=cfg.swarm.auth_mode,
+                    )
+                except Exception as e:
+                    print(f"[run] spawn {task.id} crashed: {e}", file=sys.stderr)
+                    continue
+
+                if not meta.get("worker_id"):
+                    _say(f"[run] spawn {task.id} failed: {meta.get('spawn_error', 'unknown')[:120]}")
+                    continue
+
+                def _mut(run: state.RunState, tid=task.id, m=meta):
+                    t = run.tasks[tid]
+                    t.status = "in_flight"
+                    t.target = m.get("target") or t.target
+                    t.worker_id = m["worker_id"]
+                    t.branch = m.get("branch")
+                    t.dispatched_at = m.get("dispatched_at", time.time())
+                    run.events.append({
+                        "ts": time.time(), "kind": "spawn",
+                        "task_id": tid, "target": t.target,
+                    })
+                state.update_state(_mut)
+                spawned_this_tick += 1
+                _say(f"[run] spawned {task.id} → {meta.get('target')} ({meta['worker_id']})")
+
+        # ---- Status line on change ----
+        s2 = state.read_state()
+        shipped = sum(1 for t in s2.tasks.values() if t.status == "shipped")
+        merged = sum(1 for t in s2.tasks.values() if t.merged_at is not None)
+        inf = len(state.in_flight_tasks(s2))
+        rdy = len(state.ready_tasks(s2))
+        status = f"[tick {tick}] in_flight={inf} ready={rdy} shipped={shipped} merged={merged}"
+        if status != last_status:
+            _say(status)
+            last_status = status
+
+        time.sleep(tick_s)
+
+    # Final summary
+    s = state.read_state()
+    shipped = [t for t in s.tasks.values() if t.status == "shipped"]
+    merged = [t for t in s.tasks.values() if t.merged_at is not None]
+    failed = [t for t in s.tasks.values() if t.status == "failed" or t.merge_blocker]
+    _say("")
+    _say(f"LEGION RUN COMPLETE")
+    _say(f"  Merged:   {len(merged)}")
+    _say(f"  Shipped:  {len(shipped)} (of which {len(merged)} merged)")
+    _say(f"  Failed:   {len(failed)}")
+    for t in merged:
+        if t.pr_url:
+            _say(f"    ✓ {t.id}: {t.pr_url}")
+    for t in failed:
+        reason = t.merge_blocker or t.error or "unknown"
+        _say(f"    ✗ {t.id}: {reason[:120]}")
+
+    # Clear stop marker on clean exit
+    state.clear_stop()
+    return 0 if not failed else 2
+
+
+def _silent_poll(_s):
+    """Internal: run poll logic without printing JSON (loop manages its own output)."""
+    # Re-use cmd_poll's logic but suppress stdout
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_poll(argparse.Namespace())
+
+
+def _silent_reconcile():
+    """Internal: run reconcile logic without printing JSON."""
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_reconcile(argparse.Namespace())
+
+
+# ----------------------------------------------------------------------
 # cleanup (idempotent reset)
 # ----------------------------------------------------------------------
 
@@ -649,8 +893,16 @@ def main(argv: list[str] | None = None) -> int:
     p_status.set_defaults(func=cmd_status)
 
     p_scale = sub.add_parser("scale")
-    p_scale.add_argument("n", type=int)
+    p_scale.add_argument("n", help="Integer, or 'auto' to clear override")
     p_scale.set_defaults(func=cmd_scale)
+
+    p_run = sub.add_parser("run", help="Autonomous dispatch + reconcile loop")
+    p_run.add_argument("--tick-seconds", type=int, default=10,
+                       help="Seconds between ticks (default 10)")
+    p_run.add_argument("--max-ticks", type=int, default=0,
+                       help="Max ticks before exit (default 0 = unlimited)")
+    p_run.add_argument("--quiet", action="store_true")
+    p_run.set_defaults(func=cmd_run)
 
     p_cost = sub.add_parser("cost")
     p_cost.set_defaults(func=cmd_cost)

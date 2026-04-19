@@ -68,7 +68,7 @@ def frame_prompt(task: Task, base_branch: str, branch_name: str) -> str:
 # Local spawn (subprocess)
 # ----------------------------------------------------------------------
 
-def spawn_local(task: Task, base_branch: str, branch_prefix: str) -> dict:
+def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
     """Fire off a local `claude -p` in a git worktree. Returns spawn metadata."""
     from shutil import which
     if not which("claude"):
@@ -121,12 +121,29 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str) -> dict:
         "--output-format", "stream-json",
         "--verbose",
     ]
+
+    # Pick auth per legion.toml. claude-code prefers ANTHROPIC_API_KEY env
+    # over session creds when both are present, so we need to explicitly
+    # unset the one we don't want.
+    env = {**os.environ}
+    if auth_mode == "api":
+        if not env.get("ANTHROPIC_API_KEY"):
+            return {
+                "target": "local",
+                "worker_id": None,
+                "spawn_error": "auth_mode=api but ANTHROPIC_API_KEY is not set in the environment",
+                "dispatched_at": time.time(),
+            }
+    else:  # session
+        env.pop("ANTHROPIC_API_KEY", None)
+
     proc = subprocess.Popen(
         cmd,
         cwd=worktree,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
-        start_new_session=True,  # so /legion-stop can kill cleanly
+        start_new_session=True,
+        env=env,
     )
     return {
         "target": "local",
@@ -138,21 +155,66 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str) -> dict:
     }
 
 
-def poll_local(task: Task, base_branch: str) -> dict | None:
-    """Check if the local subprocess has exited. None if still running.
+def _claude_stream_finished(log_path: Path) -> bool:
+    """Check the stream-json log for a terminal `result` event.
 
-    On exit: inspect worktree, handle commit/push/PR, return terminal status.
-    All git/gh calls are `check=False` so a failure surfaces as a status
-    dict rather than crashing the poll loop.
+    claude-code sometimes fails to exit cleanly after emitting the result,
+    so we use the log marker as the authoritative completion signal.
+    Returns True if the stream contains an event with `"type":"result"`.
+    """
+    if not log_path.exists():
+        return False
+    try:
+        # Read tail only — the result event is always near the end.
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    return '"type":"result"' in tail
+
+
+def poll_local(task: Task, base_branch: str) -> dict | None:
+    """Check if the local worker has finished. None if still running.
+
+    Completion signal: EITHER the subprocess has exited, OR the stream-json
+    log contains a terminal `result` event (claude-code sometimes hangs
+    after emitting it). If the marker is present and the pid is still
+    alive, kill it — Claude is done but the CLI wrapper didn't exit.
+
+    On completion: inspect worktree, commit/push/PR, return status dict.
     """
     if not task.worker_id or not task.worker_id.startswith("pid:"):
         return None
     pid = int(task.worker_id.split(":", 1)[1])
+
+    # Prefer log-based completion: more reliable than pid exit.
+    log_path = Path(f".legion/local_logs/{task.id}.log")
+    claude_done = _claude_stream_finished(log_path)
+
+    if not claude_done:
+        # No terminal marker yet — check pid. If pid dead, Claude crashed
+        # before emitting result (rare — usually claude emits result even on error).
+        try:
+            os.kill(pid, 0)
+            return None  # still running
+        except ProcessLookupError:
+            return {"status": "failed", "error": "worker exited without result marker"}
+
+    # claude-code finished; kill lingering process if still alive.
     try:
         os.kill(pid, 0)
-        return None  # still running
+        try:
+            os.killpg(pid, 15)  # SIGTERM the session
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
     except ProcessLookupError:
-        pass  # done
+        pass  # already exited
 
     branch = task.branch or ""
     worktree = WORKTREE_ROOT / task.id
@@ -237,7 +299,7 @@ def kill_local(task: Task, signal_num: int = 15) -> bool:
 CLOUD_LOG_ROOT = Path(".legion/cloud_logs")
 
 
-def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str) -> dict:
+def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
     """Spawn a Modal worker as a background `modal run` subprocess.
 
     `modal run --detach` actually blocks until the remote function returns —
@@ -274,6 +336,7 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str)
         "--repo-url", repo_url,
         "--base-branch", base_branch,
         "--branch-prefix", branch_prefix,
+        "--auth-mode", auth_mode,
     ]
     proc = subprocess.Popen(
         cmd,
@@ -356,11 +419,11 @@ def kill_cloud(task: Task, signal_num: int = 15) -> bool:
 # Uniform interface
 # ----------------------------------------------------------------------
 
-def spawn(task: Task, target: str, repo_url: str, base_branch: str, branch_prefix: str) -> dict:
+def spawn(task: Task, target: str, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
     if target == "local":
-        return spawn_local(task, base_branch, branch_prefix)
+        return spawn_local(task, base_branch, branch_prefix, auth_mode=auth_mode)
     if target == "cloud":
-        return spawn_cloud(task, repo_url, base_branch, branch_prefix)
+        return spawn_cloud(task, repo_url, base_branch, branch_prefix, auth_mode=auth_mode)
     raise ValueError(f"unknown target {target!r}")
 
 

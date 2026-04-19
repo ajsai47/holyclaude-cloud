@@ -115,6 +115,37 @@ def _pr_is_merged(pr_num: str) -> bool:
         return False
 
 
+def fetch_ci_failure(pr_url: str | None) -> str:
+    """Return a plain-text summary of the failing checks + their logs,
+    for a CI re-dispatch to hand back to the next worker as context.
+    """
+    num = pr_number(pr_url)
+    if not num:
+        return "(no pr to fetch)"
+    result = subprocess.run(
+        ["gh", "pr", "checks", num, "--json", "name,state,conclusion,link"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return f"(gh pr checks failed: {result.stderr.strip()})"
+    try:
+        checks = json.loads(result.stdout)
+    except Exception:
+        return "(could not parse gh pr checks output)"
+    failing = [c for c in checks if c.get("conclusion") == "failure"]
+    if not failing:
+        return "(no failing checks detected at fetch time)"
+
+    lines = ["The following CI checks failed on the previous attempt's PR:"]
+    for c in failing:
+        name = c.get("name", "?")
+        link = c.get("link", "")
+        lines.append(f"- **{name}** — {link}")
+    lines.append("")
+    lines.append("The next worker should address these failures before shipping.")
+    return "\n".join(lines)
+
+
 def merge_pr(task: Task) -> dict:
     """Attempt to merge task's PR. Returns a result dict."""
     num = pr_number(task.pr_url)

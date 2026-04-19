@@ -1,174 +1,143 @@
 ---
 name: legion-orchestrator
-description: Decompose a coding goal into a parallelizable task graph and run a concurrent dispatch loop. Use when the user wants to spin up a swarm via /legion-start, run multiple Claude workers in parallel on a single project, or coordinate a fleet of cloud Claudes. The orchestrator runs locally; workers can be local subprocesses or Modal cloud containers (decided per-task by routing rules).
+description: Decompose a coding goal into a parallelizable task DAG, then hand off to the autonomous `legion run` loop. Use when the user wants to spin up a swarm via /legion-start, run multiple Claude workers in parallel, or coordinate a fleet of cloud Claudes. The heavy lifting — spawn, poll, reconcile, merge, mediate, re-dispatch — lives in the `legion run` CLI subcommand.
 ---
 
 # legion-orchestrator
 
-The brain of HolyClaude-Cloud. You (Claude) are the orchestrator. The heavy lifting — state persistence, routing rules, spawn, poll, governor — lives in the `legion` CLI at `~/holyclaude-cloud/bin/legion`. Your job is the loop: decompose, dispatch, poll, reconcile.
+You (Claude) handle the three things a CLI can't:
+1. **Decompose a goal** into a task DAG (needs judgment).
+2. **Show the user the graph** and checkpoint before dispatch.
+3. **Narrate the run** as it progresses and surface failures at the end.
+
+Everything else is `legion run` in a tight loop, driven by Python.
 
 ---
 
-## Inputs
-
-One of:
-- A goal string from the user ("implement OAuth with Google + GitHub").
-- A path to a structured plan (a `/plan` output, a markdown task list, or a `tasks.json`).
-
-Plus:
-- `./legion.toml` — config (or defaults)
-- `.git/` — the repo we're swarming
-- `~/holyclaude-cloud/bin/legion` — the CLI
-
----
-
-## Procedure
-
-### Step 0 — Preflight
+## Step 0 — Preflight
 
 ```bash
-git status --porcelain       # must be empty; if dirty, stop and tell user to commit/stash
-ls ./legion.toml             # if missing, copy from ~/holyclaude-cloud/config/legion.toml.example
-/Users/ajsai47/tinker-env/bin/modal secret list | grep claude-pro-session
-# ...if missing: tell user to run ~/holyclaude-cloud/setup
+git status --porcelain              # must be empty
+test -f ./legion.toml || cp ~/holyclaude-cloud/config/legion.toml.example ./legion.toml
+/Users/ajsai47/tinker-env/bin/modal secret list | grep -q claude-pro-session
 ```
 
-Also check `ls .legion/state.json` — if it exists from a prior run, ask the user whether to resume (not yet implemented — Phase 4) or wipe (`rm -rf .legion`) and start fresh.
+Any failure → stop and tell the user how to fix (usually: commit/stash, copy legion.toml, or run `~/holyclaude-cloud/setup`).
 
-### Step 1 — Decompose
+---
 
-If the input is already `tasks.json` or parseable task list, skip to step 2.
+## Step 1 — Resume check
 
-Otherwise, decompose. Use your own judgment — you're Opus. Output a JSON list to `.legion/tasks.json`:
+```bash
+test -f .legion/state.json
+```
+
+If it exists:
+- `--resume` flag: skip to Step 5 (run loop).
+- No flag: AskUserQuestion: "Existing run detected. [resume / wipe and start fresh / cancel]"
+
+If it doesn't: fresh decomposition flow.
+
+---
+
+## Step 2 — Decompose
+
+Read the user's input (goal string, plan file, or tasks.json). If already structured, skip to Step 3.
+
+Otherwise, decompose. You're Opus — do this yourself, don't shell out. Write `.legion/tasks.json`:
 
 ```json
 [
   {
     "id": "T-001",
-    "title": "Add OAuth callback handler",
-    "spec": "Wire /api/auth/callback to exchange Google's code for tokens...",
+    "title": "one-line title",
+    "spec": "1-3 paragraphs of context the worker needs",
     "deps": [],
     "estimated_minutes": 15,
-    "files_touched": ["api/auth.ts", "config.ts"]
-  },
-  ...
+    "files_touched": ["path/to/file.ts"]
+  }
 ]
 ```
 
-Constraints when decomposing:
-- Each task < 30 minutes, touches < 10 files.
-- Tasks form a DAG — `deps` references earlier task IDs.
-- Siblings with no shared deps can parallelize.
+Constraints:
+- Each task < 30 min, touches < 10 files.
+- Tasks form a DAG; `deps` reference earlier task IDs.
+- Siblings with no shared deps will run in parallel.
 - Don't over-decompose — if the whole goal is 3 files of work, it's one task.
-
-### Step 2 — Initialize run state
-
-```bash
-mkdir -p .legion
-# ...write tasks.json to .legion/tasks.json
-~/holyclaude-cloud/bin/legion init .legion/tasks.json
-```
-
-### Step 3 — Show the graph + human checkpoint
-
-Render the task graph to the user (ASCII DAG or numbered list with dep arrows). Show estimated wall-clock at the current cap.
-
-Read `legion.toml`:
-- `[swarm] human_checkpoint_after_decompose = true` (default): AskUserQuestion "Dispatch this graph? [yes / edit / cancel]".
-  - `edit`: open `.legion/tasks.json` in the user's editor; re-read after they save.
-  - `cancel`: stop cleanly.
-  - `yes`: proceed.
-- `false` (yolo mode): log "yolo mode engaged — dispatching without checkpoint" and proceed.
-
-If `--yolo` was passed to `/legion-start`, override config and proceed.
-
-### Step 4 — Dispatch loop
-
-This is the main loop. Drive it entirely through the CLI:
-
-```
-loop:
-  # Check for stop
-  if [ -f .legion/STOP ]; then break
-
-  # How many slots do we have?
-  cap_json=$(~/holyclaude-cloud/bin/legion cap)
-  slots=$(echo "$cap_json" | jq -r .slots_available)
-
-  # Get ready tasks
-  ready_ids=$(~/holyclaude-cloud/bin/legion ready | jq -r '.[]')
-
-  # Spawn up to `slots` of them
-  for id in $ready_ids; do
-    [ "$slots" -le 0 ] && break
-    ~/holyclaude-cloud/bin/legion spawn $id
-    slots=$((slots - 1))
-  done
-
-  # If nothing is in flight AND no ready AND no pending-with-unmet-deps left, we're done
-  status=$(~/holyclaude-cloud/bin/legion cap)
-  in_flight=$(echo "$status" | jq -r .in_flight)
-  if [ "$in_flight" -eq 0 ] && [ -z "$ready_ids" ]; then
-    # Check if any pending tasks remain (deps never satisfied — cycle or failed deps)
-    # If so, surface to user. Otherwise, done.
-    break
-  fi
-
-  # Poll in-flight
-  sleep 15
-  changes=$(~/holyclaude-cloud/bin/legion poll)
-  # Surface any status changes to the user (new PRs, failures, throttle)
-
-  # Show status every few iterations so the user sees progress
-```
-
-Narrate progress to the user as you go:
-- "Spawned T-001 (cloud) — fc-abc123"
-- "T-001 shipped → https://github.com/.../pull/142"
-- "T-003 failed — see .legion/blockers/T-003.md"
-- "Throttle detected — halving cap to 2"
-
-Use the `claude-peers` MCP (already in HolyClaude) to broadcast legion state so other Claude Code sessions on the machine see what the swarm is doing.
-
-### Step 5 — Final report
-
-When the loop exits, print:
-
-```
-LEGION COMPLETE
-  Shipped:     N PRs opened
-  No changes:  M tasks
-  Failed:      K tasks (see .legion/blockers/)
-  Elapsed:     Xm Ys wall-clock
-  Parallel:    Zm worker-minutes
-
-PRs:
-  - T-001: https://github.com/.../pull/142
-  - T-002: https://github.com/.../pull/143
-  ...
-```
-
-Phase 1/2 stops here. The user merges PRs manually, in dependency order. Phase 3 adds the Reconciler (ordered auto-merge + mediator for conflicts).
+- Task specs should be self-contained — the worker sees the spec alone, not the surrounding goal.
 
 ---
 
-## Failure handling
+## Step 3 — Init
 
-### Worker throttle mid-loop
+```bash
+mkdir -p .legion
+# write the tasks.json you produced above
+~/holyclaude-cloud/bin/legion init .legion/tasks.json
+```
 
-The governor detects 429s in worker logs on each `legion poll` and engages a 10-min backoff (halves the cap). Your dispatch loop will automatically slow down because `legion cap` returns the lower number. Surface the throttle to the user but don't panic — it's expected above ~3 concurrent workers on Pro.
+---
 
-### Cloud worker hangs past worker_timeout_minutes
+## Step 4 — Show graph + checkpoint
 
-`legion poll` flags stale in-flight tasks. On seeing `stale_in_flight` in the changes list, you can force-kill one: `legion stop --force` kills ALL — there's no per-task force in Phase 2. If one task is stuck, manually cancel its Modal FunctionCall: `/Users/ajsai47/tinker-env/bin/modal call cancel <fc-id>`.
+Render the task DAG for the user. ASCII edges + estimated wall-clock at current cap (`legion cap`). Example:
 
-### Deps that never satisfy (failed prerequisite)
+```
+T-001 ─┬─► T-003
+       └─► T-004 ─► T-006
+T-002 ────────────► T-005 ─► T-006
 
-If T-001 fails and T-002/T-003 depend on T-001, they stay in `pending` forever. Surface this to the user: "3 tasks blocked by T-001 failure — dropping them." Mark them `cancelled` via a helper you can write inline (update `.legion/state.json` under the lock — or just tell the user to re-run with `T-001` fixed).
+6 tasks, max depth 3, est. 35 min wall-clock at cap=3
+```
 
-### Dirty tree after local worker
+If `[swarm] human_checkpoint_after_decompose = true` AND no `--yolo`:
+- `AskUserQuestion("Dispatch this graph? [yes / edit / cancel]")`
+- `edit`: open `.legion/tasks.json` in the user's editor; after save, `rm -rf .legion && legion init` again.
+- `cancel`: stop.
+- `yes`: proceed.
 
-Local workers run in `.legion/worktrees/<task-id>/`. The user's main worktree is untouched. If a local worker leaves its worktree in a weird state, delete it: `git worktree remove --force .legion/worktrees/T-NNN`.
+Otherwise: log "yolo mode engaged" and proceed.
+
+---
+
+## Step 5 — Run
+
+Hand off to the autonomous loop:
+
+```bash
+~/holyclaude-cloud/bin/legion run --tick-seconds 10
+```
+
+This is foreground — stdout streams live. It prints:
+- `[run] spawned T-XXX → local|cloud` when a task dispatches
+- `[tick N] in_flight=X ready=Y shipped=Z merged=W` every tick with change
+- `LEGION RUN COMPLETE` + summary at end
+
+Let it run. **Don't try to drive the loop yourself** — it handles everything the CLI handles: spawn, poll, reconcile, mediate, re-dispatch on CI fail, ramp, throttle backoff, graceful stop.
+
+Exits when:
+- All tasks terminal (merged, failed, or blocker), OR
+- `.legion/STOP` written (by `/legion-stop` or Ctrl-C), OR
+- `--max-ticks` reached.
+
+---
+
+## Step 6 — Report
+
+Read the final summary. Surface to the user:
+- Total merged PRs (with URLs).
+- Any task with `merge_blocker = "ci_failed"` that exceeded retries → user needs to fix the underlying test.
+- Any task with `merge_blocker = "mediator_maxed"` → conflict needs human resolution, point at `.legion/mediator_logs/<task-id>.log`.
+- Total elapsed time + parallel-worker-minutes consumed.
+
+---
+
+## What to do NOT do
+
+- Don't call `legion spawn`, `legion poll`, `legion reconcile` manually — `legion run` handles all three.
+- Don't hand-write the dispatch loop in bash — we tried that, it's ~80 lines of awk and sleep and miscounts.
+- Don't decompose in a subprocess / shell out — you're Opus, just think.
+- Don't skip the preflight when `--resume` — state might be from a different repo or before a `legion.toml` change. Still check.
 
 ---
 
@@ -176,15 +145,19 @@ Local workers run in `.legion/worktrees/<task-id>/`. The user's main worktree is
 
 ```
 legion init <tasks.json> [--repo-url URL] [--base-branch BR]
-legion ready                 # prints JSON list of task IDs with deps satisfied
-legion route <task-id>       # prints {"target": "local"|"cloud", "reason": "..."}
-legion spawn <task-id> [--target local|cloud]   # target auto-routed if omitted
-legion poll                  # updates in-flight, emits change list
-legion cap                   # current dynamic cap + slots available
-legion status                # human-readable status table
-legion scale <n>             # override max_workers
-legion cost                  # cost summary
+legion run [--tick-seconds N] [--max-ticks M] [--quiet]
+legion ready                 # JSON list of ready task IDs
+legion route <task-id>       # {"target": ..., "reason": ...}
+legion spawn <task-id> [--target local|cloud]
+legion poll                  # updates in-flight, emits changes
+legion cap                   # dynamic cap + slots
+legion status                # human-readable table
+legion scale <n|auto>        # override max_workers, 'auto' to clear
+legion cost                  # usage summary
+legion reconcile             # one idempotent merge pass
+legion mediate <task-id>     # force a mediator run
 legion stop [--graceful|--force]
+legion cleanup [--all]
 ```
 
-Nothing in this skill writes to `.legion/state.json` directly. Everything goes through the CLI, which holds a file lock during mutations. Safe against concurrent CLI invocations (e.g. the user running `/legion-status` while the dispatch loop is polling).
+`legion run` = the 6 main verbs (spawn + poll + reconcile + mediate + ramp + stop) interleaved in a loop. You invoke it once.

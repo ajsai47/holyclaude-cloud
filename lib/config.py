@@ -15,6 +15,9 @@ class SwarmConfig:
     max_workers: int = 5
     ramp_first_run: bool = True
     human_checkpoint_after_decompose: bool = True
+    # "session" (default, Pro rate-limits apply) or "api" (Anthropic API key,
+    # costs money but no throttle). Applies to workers, not the orchestrator.
+    auth_mode: str = "session"
 
 
 @dataclass

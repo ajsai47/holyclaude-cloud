@@ -109,6 +109,20 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# 5b. Push Anthropic API key secret (for auth_mode="api" escape hatch)
+# ---------------------------------------------------------------------
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "setup: pushing anthropic-api-key secret (auth_mode='api' escape hatch)"
+    "$MODAL_BIN" secret delete anthropic-api-key --yes >/dev/null 2>&1 || true
+    "$MODAL_BIN" secret create anthropic-api-key \
+        ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+else
+    echo "setup: no ANTHROPIC_API_KEY in env — skipping anthropic-api-key secret"
+    echo "  (fine; legion.toml [swarm] auth_mode defaults to 'session'.)"
+    echo "  Set the env var and re-run setup if you want the --api escape hatch."
+fi
+
+# ---------------------------------------------------------------------
 # 6. Drop legion.toml if missing in cwd at install time
 # ---------------------------------------------------------------------
 if [[ ! -f "./legion.toml" && ! -f "$PWD/legion.toml" ]]; then

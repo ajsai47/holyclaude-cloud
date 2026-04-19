@@ -93,10 +93,21 @@ WORKER_CACHE_VOLUME = "holyclaude-cloud-worker-cache"
 shared_brain = modal.Volume.from_name(SHARED_BRAIN_VOLUME, create_if_missing=True)
 worker_cache = modal.Volume.from_name(WORKER_CACHE_VOLUME, create_if_missing=True)
 
-SECRETS = [
-    modal.Secret.from_name("claude-pro-session"),
-    modal.Secret.from_name("legion-github"),
-]
+# Always attach both auth secrets; the worker picks one at runtime based
+# on the --auth-mode parameter. `anthropic-api-key` may not exist yet —
+# wrap in a try so workers keep working with just Pro session auth.
+def _optional_secret(name: str):
+    try:
+        return modal.Secret.from_name(name)
+    except Exception:
+        return None
+
+_auth_secrets = [s for s in (
+    _optional_secret("claude-pro-session"),
+    _optional_secret("anthropic-api-key"),
+) if s is not None]
+
+SECRETS = _auth_secrets + [modal.Secret.from_name("legion-github")]
 
 
 app = modal.App("holyclaude-cloud-worker")
@@ -133,6 +144,7 @@ def run_task(
     base_branch: str = "main",
     pr_body: str = "",
     branch_prefix: str = "legion/",
+    auth_mode: str = "session",
 ) -> dict:
     """Execute one task. Idempotent on task_id — re-running with same id
     will reuse the cached worktree if present."""
@@ -163,7 +175,8 @@ def run_task(
 
     try:
         return _run_task_body(task_id, title, prompt, repo_url, base_branch,
-                              pr_body, branch_prefix, t_start, log, step)
+                              pr_body, branch_prefix, t_start, log, step,
+                              auth_mode=auth_mode)
     except subprocess.CalledProcessError as e:
         err = f"subprocess failed: {' '.join(str(a) for a in e.cmd)} -> rc={e.returncode}"
         if e.stderr:
@@ -180,22 +193,41 @@ def run_task(
 def _run_task_body(
     task_id, title, prompt, repo_url, base_branch,
     pr_body, branch_prefix, t_start, log, step,
+    auth_mode="session",
 ):
     # ---------------------------------------------------------------
-    # 1. Auth setup — Pro session creds + GitHub
+    # 1. Auth setup — pick auth_mode
     # ---------------------------------------------------------------
-    creds_json = os.environ.get("CLAUDE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise RuntimeError(
-            "claude-pro-session secret must expose CLAUDE_CREDENTIALS_JSON. "
-            "Run holyclaude-cloud's setup script."
-        )
-    claude_dir = Path.home() / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    creds_path = claude_dir / ".credentials.json"
-    creds_path.write_text(creds_json)
-    creds_path.chmod(0o600)
-    step("wrote Pro session creds")
+    if auth_mode == "api":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "auth_mode=api but ANTHROPIC_API_KEY not set. Push the "
+                "anthropic-api-key Modal secret (setup script does this "
+                "automatically if the env var is set locally)."
+            )
+        # Clear any pro session creds to avoid claude-code preferring them
+        creds_path = Path.home() / ".claude" / ".credentials.json"
+        if creds_path.exists():
+            creds_path.unlink()
+        step("using ANTHROPIC_API_KEY for auth")
+    else:
+        creds_json = os.environ.get("CLAUDE_CREDENTIALS_JSON")
+        if not creds_json:
+            raise RuntimeError(
+                "auth_mode=session but claude-pro-session secret is missing "
+                "CLAUDE_CREDENTIALS_JSON. Run holyclaude-cloud's setup script, "
+                "or switch legion.toml [swarm] auth_mode = 'api'."
+            )
+        claude_dir = Path.home() / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        creds_path = claude_dir / ".credentials.json"
+        creds_path.write_text(creds_json)
+        creds_path.chmod(0o600)
+        # If ANTHROPIC_API_KEY is also set (from the api secret), unset it so
+        # claude-code doesn't prefer it over the session creds
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        step("wrote Pro session creds")
 
     gh_token = os.environ.get("GITHUB_TOKEN")
     if not gh_token:

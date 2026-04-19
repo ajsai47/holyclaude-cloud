@@ -14,6 +14,14 @@ ramp_first_run = true
 # Set false for full-autonomous yolo mode.
 human_checkpoint_after_decompose = true
 
+# Auth mode for workers (not for the orchestrator Claude session):
+#   "session" — Pro session token. Free but shared rate limits kick in at
+#               ~3-5 concurrent workers.
+#   "api"     — ANTHROPIC_API_KEY. No throttle, but you pay per token.
+# Requires the setup script to have pushed the anthropic-api-key Modal
+# secret (it does this automatically if $ANTHROPIC_API_KEY is set locally).
+auth_mode = "session"
+
 [budget]
 # Hard ceiling for $/hour of Modal spend. 0 means no $ cap (Pro session is free).
 # Set this if you ever flip workers to API auth — runaway autoloops have killed wallets.
