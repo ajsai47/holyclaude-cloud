@@ -234,17 +234,36 @@ def kill_local(task: Task, signal_num: int = 15) -> bool:
 # Cloud spawn (Modal)
 # ----------------------------------------------------------------------
 
-def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str) -> dict:
-    """Spawn a Modal worker via `modal run --detach`, capturing the FunctionCall ID.
+CLOUD_LOG_ROOT = Path(".legion/cloud_logs")
 
-    We shell out to the modal CLI rather than using the Python SDK because
-    the orchestrator runs wherever Claude Code lives — not necessarily in
-    the same venv as modal.
+
+def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str) -> dict:
+    """Spawn a Modal worker as a background `modal run` subprocess.
+
+    `modal run --detach` actually blocks until the remote function returns —
+    "detach" only means the app persists beyond CLI exit, it doesn't mean
+    async dispatch. So we Popen it in the background (like local workers)
+    and track the CLI pid. Poll waits on pid exit and then pulls the
+    worker's result.json from the Modal volume.
+
+    Result of the function itself lands in the Modal Volume
+    `holyclaude-cloud-worker-cache` at <task-id>/result.json, written by
+    the worker before return. `poll_cloud` pulls it once the CLI exits.
     """
-    modal_bin = find_modal_bin()
-    # `modal run --detach` prints the FunctionCall ID on stdout.
-    # We invoke run_task directly with CLI args.
+    try:
+        modal_bin = find_modal_bin()
+    except RuntimeError as e:
+        return {
+            "target": "cloud",
+            "worker_id": None,
+            "spawn_error": str(e),
+            "dispatched_at": time.time(),
+        }
+
     module_path = Path(__file__).parent.parent / "modal" / "worker.py"
+    CLOUD_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    log_path = CLOUD_LOG_ROOT / f"{task.id}.log"
+    log_fh = open(log_path, "wb")
 
     cmd = [
         modal_bin, "run", "--detach",
@@ -256,69 +275,81 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str)
         "--base-branch", base_branch,
         "--branch-prefix", branch_prefix,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return {
-            "target": "cloud",
-            "worker_id": None,
-            "spawn_error": result.stderr,
-            "dispatched_at": time.time(),
-        }
-
-    # Parse FunctionCall ID out of the modal output.
-    # modal CLI emits something like "fc-Abc123XYZ...". Match liberally.
-    import re as _re
-    call_id = None
-    for source in (result.stdout, result.stderr):
-        match = _re.search(r"\bfc-[a-zA-Z0-9]+\b", source or "")
-        if match:
-            call_id = match.group(0)
-            break
-
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # so /legion-stop --force can killpg
+    )
     return {
         "target": "cloud",
-        "worker_id": f"modal:{call_id}" if call_id else None,
+        "worker_id": f"pid:{proc.pid}",
         "branch": f"{branch_prefix}{task.id}",
+        "log": str(log_path),
         "dispatched_at": time.time(),
-        "spawn_stdout": result.stdout[-500:],
     }
 
 
 def poll_cloud(task: Task) -> dict | None:
-    """Check a Modal FunctionCall. Returns status dict or None if still running."""
-    if not task.worker_id or not task.worker_id.startswith("modal:"):
+    """Check if the background `modal run` subprocess has exited.
+    None while still running; on exit, pull result.json from the volume."""
+    if not task.worker_id or not task.worker_id.startswith("pid:"):
         return None
-    call_id = task.worker_id.split(":", 1)[1]
-    if not call_id or call_id == "None":
-        return {"status": "failed", "error": "no call id recorded"}
+    pid = int(task.worker_id.split(":", 1)[1])
+    try:
+        os.kill(pid, 0)
+        return None  # still running
+    except ProcessLookupError:
+        pass  # done
 
-    modal_bin = find_modal_bin()
-    # `modal call-logs <id>` prints logs; `modal call <id>` isn't a thing.
-    # Cleanest: use the Python SDK via a tiny helper script.
-    # Even cleaner: the worker writes its result to the worker-cache Volume.
-    # Check for a result marker in .legion/cloud_results/<task-id>.json which
-    # the poll subcommand pulls via `modal volume get` before calling us.
+    # Subprocess exited. Pull result.json from the worker-cache Volume.
     result_path = Path(f".legion/cloud_results/{task.id}.json")
-    if result_path.exists():
-        try:
-            return json.loads(result_path.read_text())
-        except Exception as e:
-            return {"status": "failed", "error": f"bad result json: {e}"}
-    return None  # still running
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        modal_bin = find_modal_bin()
+    except RuntimeError as e:
+        return {"status": "failed", "error": f"modal CLI gone: {e}"}
 
-
-def kill_cloud(task: Task) -> bool:
-    """Cancel a Modal FunctionCall via CLI."""
-    if not task.worker_id or not task.worker_id.startswith("modal:"):
-        return False
-    call_id = task.worker_id.split(":", 1)[1]
-    modal_bin = find_modal_bin()
-    # modal call cancel <fc-id>
-    result = subprocess.run(
-        [modal_bin, "call", "cancel", call_id],
+    pull = subprocess.run(
+        [modal_bin, "volume", "get",
+         "holyclaude-cloud-worker-cache",
+         f"{task.id}/result.json",
+         str(result_path), "--force"],
         capture_output=True, text=True,
     )
-    return result.returncode == 0
+    if pull.returncode != 0 or not result_path.exists():
+        # Worker crashed before emitting result.json; surface the last
+        # ~400 chars of the CLI log so we have some signal.
+        log_path = CLOUD_LOG_ROOT / f"{task.id}.log"
+        tail = ""
+        if log_path.exists():
+            try:
+                tail = log_path.read_text(errors="replace")[-400:]
+            except Exception:
+                tail = "<unreadable log>"
+        return {
+            "status": "failed",
+            "error": f"no result.json on volume; cli log tail: {tail}",
+        }
+
+    try:
+        return json.loads(result_path.read_text())
+    except Exception as e:
+        return {"status": "failed", "error": f"bad result json: {e}"}
+
+
+def kill_cloud(task: Task, signal_num: int = 15) -> bool:
+    """Kill the `modal run` subprocess. Modal's detach mode means the
+    cloud function keeps running on Modal's side — use
+    `modal app stop <app-id>` for that."""
+    if not task.worker_id or not task.worker_id.startswith("pid:"):
+        return False
+    pid = int(task.worker_id.split(":", 1)[1])
+    try:
+        os.killpg(pid, signal_num)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -342,8 +373,9 @@ def poll(task: Task, base_branch: str) -> dict | None:
 
 
 def kill(task: Task, force: bool = False) -> bool:
+    sig = 9 if force else 15
     if task.target == "local":
-        return kill_local(task, signal_num=9 if force else 15)
+        return kill_local(task, signal_num=sig)
     if task.target == "cloud":
-        return kill_cloud(task)
+        return kill_cloud(task, signal_num=sig)
     return False
