@@ -204,10 +204,15 @@ def clear_stop() -> None:
 # ----------------------------------------------------------------------
 
 def ready_tasks(state: RunState) -> list[Task]:
-    """Tasks whose deps are all shipped (or no_changes — counts as complete)."""
+    """Tasks whose deps are all merged (or no_changes — counts as complete).
+
+    A shipped-but-unmerged dep does not count: the downstream worker clones
+    `main` and would not see the dep's code, forcing it to either fail or
+    silently reimplement work. Wait for the merge.
+    """
     done = {
         tid for tid, t in state.tasks.items()
-        if t.status in ("shipped", "no_changes")
+        if t.merged_at is not None or t.status == "no_changes"
     }
     return [
         t for t in state.tasks.values()

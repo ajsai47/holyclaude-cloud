@@ -48,6 +48,113 @@ surprising breakage would reprioritize the Phase 5 roadmap.
 
 ---
 
+## 🧪 Dogfood #3 — ghost-v2 cross-repo run (2026-04-19 evening)
+
+First run on a non-self repo. Target: `ajsai47/ghost-v2` (TypeScript
+monorepo, bun + turbo + vitest + biome, no branch protection, real CI).
+2-task DAG: add `Result<T,E>` to `packages/types` → refactor `parseLine`
+in `packages/browser/src/snapshot/tree.ts` to consume it.
+
+**Happy-path outcome after 3 false-starts:** 2 PRs shipped and merged in
+6 min 25s of actual worker wall-clock.
+[PR #1](https://github.com/ajsai47/ghost-v2/pull/1) ·
+[PR #2](https://github.com/ajsai47/ghost-v2/pull/2).
+
+### New findings (priority-ordered for next session)
+
+1. **CRITICAL — dispatcher spawns on `shipped`, not `merged`.** T-002 was
+   dispatched 26s before T-001 was merged into `main`. T-002's worker
+   cloned `main` without T-001's `Result<T,E>` present, then
+   re-implemented `result.ts`, `result.test.ts`, and `vitest.config.ts`
+   from scratch. Merge succeeded only because both workers produced
+   byte-identical code by coincidence — with any non-determinism
+   (ordering, naming, style) this would have been a conflict or wrong
+   behavior. Reviewer on PR #2 caught it: *"T-002 silently re-implements
+   it"*. Fix: dispatcher's readiness check must wait for all deps in
+   `merged` status, not just `shipped`.
+
+2. **`worker.py` UnboundLocal in `auth_mode=api` branch.** `claude_dir`
+   was defined only in the session-auth else branch (line 219) but
+   referenced unconditionally at line 273 (`plugins_dir = claude_dir /
+   "plugins"`). API auth path crashed immediately. **Fixed locally in
+   `modal/worker.py`, uncommitted** — lifted `claude_dir` definition
+   above the if/else. Awaiting review + commit.
+
+3. **`legion run` summary miscounts terminal states.** First failure run
+   printed `Failed: 0` despite `state.json` marking T-001 as
+   `claude_failed`. The `claude_failed` status bypasses the `failed`
+   tally in the summary printer. Mild — doesn't affect correctness, does
+   affect operator trust ("why did this run end if nothing failed?").
+
+4. **Session auth can't be auto-provisioned on newer Claude Code.**
+   `setup` reads `~/.claude/.credentials.json`; that file no longer
+   exists on this machine — session creds appear to have moved to macOS
+   Keychain in a recent Claude Code version. Setup pushed whatever
+   `claude-pro-session` secret was there previously, which had stale
+   creds and returned 401 from Anthropic. Needs Keychain-read path in
+   setup, OR clear error message + instructions when the creds file is
+   missing.
+
+5. **API auth path validated end-to-end** (closes Tier 1 item #3 from
+   v0.1.0 handoff). Once a real `ANTHROPIC_API_KEY` is pushed to the
+   `anthropic-api-key` Modal secret, workers authenticate and run
+   without touching Pro session at all. `setup`'s placeholder-pushing
+   behavior for the api secret when env is empty is correct — the
+   worker's precondition check (`startswith("placeholder-")`) caught it
+   cleanly.
+
+6. **Review gate validated on real TypeScript.** Reviewer produced 4
+   specific, correct `warnings`-tier issues across the 2 PRs:
+   - PR #1: test file uses `as` casts instead of the `isOk`/`isErr`
+     guards it's meant to validate
+   - PR #1: `vitest.config.ts` sets `globals: true` AND test file
+     imports `{ describe, expect, it }` — contradictory
+   - PR #2: worker used only `!isOk`, never `isErr`, despite spec
+     saying "use isOk/isErr for narrowing"
+   - PR #2: re-implemented T-001's files (see finding #1)
+   5b is not just "works" on TS — it's *productive*. Every warning was
+   actionable.
+
+7. **`.mcp.json` in target repo trips worker's claude-code init**
+   (tangential). Transcript showed `{"name":"ghost-v2","status":"failed"}`
+   during `system init`. Didn't block this run because T-001 succeeded
+   anyway, but will bite repos that depend on their MCP server at
+   runtime. Either: worker disables `.mcp.json` before `claude -p`, or
+   adds MCP-server bootstrap to the preflight.
+
+### Revised Tier 1 priority list for Session 2
+
+Supersedes the list at the top of this file.
+
+1. **[NEW] Dispatcher spawn-on-merged** (finding #1 — critical)
+2. **[NEW] Commit the `claude_dir` fix** (finding #2)
+3. **[NEW] `legion run` summary miscount** (finding #3 — small)
+4. **Session auth** (finding #4 + original Tier 1 path #1)
+5. **`/legion-start --resume`** (original Tier 1 path #4)
+6. **Branch-protected main** (original Tier 1 path #5)
+7. **Pre-commit hooks in target repo** (original Tier 1 path #6)
+8. **CI re-dispatch end-to-end** (original Tier 1 path #2 — still open;
+   this run had all CI runs pass, didn't fire the re-dispatch path)
+9. **`.mcp.json` handling** (finding #7 — lower)
+
+Dropped from list: `auth_mode="api"` end-to-end — closed by this run.
+
+### Operational findings (for Tier 5 trust surface later)
+
+- **Secret hygiene.** Re-pushing the API-key secret required
+  `modal secret create anthropic-api-key ANTHROPIC_API_KEY=<value>` with
+  the value on the command line. Value leaks into shell history + tool
+  transcripts. `setup` should prefer stdin or env-only for secret
+  creation. User should rotate keys that pass through this path.
+- **Placeholder convention works.** The
+  `placeholder-run-setup-with-ANTHROPIC_API_KEY-set-to-enable-api-mode`
+  default value is a nice pattern — lets the Modal function decorator
+  always attach the secret without failing deployment, and the worker's
+  `startswith("placeholder-")` check produces a useful error rather
+  than a cryptic 401.
+
+---
+
 ## Phase 1 — Single-worker happy path  ✅ shipped
 
 - [x] Repo scaffold + plugin manifest

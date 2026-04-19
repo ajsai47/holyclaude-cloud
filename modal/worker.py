@@ -194,6 +194,8 @@ def _run_task_body(
     # ---------------------------------------------------------------
     # 1. Auth setup — pick auth_mode
     # ---------------------------------------------------------------
+    claude_dir = Path.home() / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
     if auth_mode == "api":
         api_key = os.environ.get("ANTHROPIC_API_KEY") or ""
         if not api_key or api_key.startswith("placeholder-"):
@@ -204,7 +206,7 @@ def _run_task_body(
                 "key, then retry."
             )
         # Clear any pro session creds to avoid claude-code preferring them
-        creds_path = Path.home() / ".claude" / ".credentials.json"
+        creds_path = claude_dir / ".credentials.json"
         if creds_path.exists():
             creds_path.unlink()
         step("using ANTHROPIC_API_KEY for auth")
@@ -216,8 +218,6 @@ def _run_task_body(
                 "CLAUDE_CREDENTIALS_JSON. Run holyclaude-cloud's setup script, "
                 "or switch legion.toml [swarm] auth_mode = 'api'."
             )
-        claude_dir = Path.home() / ".claude"
-        claude_dir.mkdir(parents=True, exist_ok=True)
         creds_path = claude_dir / ".credentials.json"
         creds_path.write_text(creds_json)
         creds_path.chmod(0o600)
