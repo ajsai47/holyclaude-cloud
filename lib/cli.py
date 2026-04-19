@@ -776,7 +776,7 @@ def cmd_decompose_refine(args) -> int:
         }, indent=2))
     else:
         print(json.dumps({
-            "status": "stable" if result.converged else "no_refinement",
+            "status": "stable" if not result.flags else "no_refinement",
             "iterations": result.iterations,
             "flag_count": len(result.flags),
             "summary": result.llm_summary,
