@@ -2,6 +2,10 @@
 .legion/
 legion.toml
 
+# Local dev tooling
+.supercoder/
+.claude-mem/
+
 # Python
 __pycache__/
 *.pyc
