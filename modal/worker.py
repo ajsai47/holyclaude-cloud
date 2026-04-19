@@ -144,6 +144,43 @@ def run_task(
         print(line, flush=True)
         log.append(line)
 
+    # Early-emit helper for catastrophic failures so poll_cloud doesn't hang.
+    def _emit_crash(err: str) -> dict:
+        crash_dir = Path(WORKER_CACHE_MOUNT) / task_id
+        try:
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            (crash_dir / "log.txt").write_text("\n".join(log))
+            (crash_dir / "result.json").write_text(json.dumps({
+                "task_id": task_id,
+                "status": "failed",
+                "error": err,
+                "elapsed_s": time.perf_counter() - t_start,
+            }, indent=2))
+            worker_cache.commit()
+        except Exception as commit_err:
+            print(f"[worker:{task_id}] failed to emit crash result: {commit_err}")
+        return {"task_id": task_id, "status": "failed", "error": err}
+
+    try:
+        return _run_task_body(task_id, title, prompt, repo_url, base_branch,
+                              pr_body, branch_prefix, t_start, log, step)
+    except subprocess.CalledProcessError as e:
+        err = f"subprocess failed: {' '.join(str(a) for a in e.cmd)} -> rc={e.returncode}"
+        if e.stderr:
+            err += f"  stderr={e.stderr[-400:]}"
+        step(err)
+        return _emit_crash(err)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        step(f"unexpected error: {e}\n{tb}")
+        return _emit_crash(f"{type(e).__name__}: {e}\n{tb}")
+
+
+def _run_task_body(
+    task_id, title, prompt, repo_url, base_branch,
+    pr_body, branch_prefix, t_start, log, step,
+):
     # ---------------------------------------------------------------
     # 1. Auth setup — Pro session creds + GitHub
     # ---------------------------------------------------------------
@@ -163,30 +200,37 @@ def run_task(
     gh_token = os.environ.get("GITHUB_TOKEN")
     if not gh_token:
         raise RuntimeError("legion-github secret must expose GITHUB_TOKEN")
-    # Configure gh + git
-    subprocess.run(
-        ["gh", "auth", "login", "--with-token"],
-        input=gh_token, text=True, check=True,
-    )
-    subprocess.run(["gh", "auth", "setup-git"], check=True)
+
+    # gh picks up GH_TOKEN/GITHUB_TOKEN automatically — no `gh auth login` needed
+    # (which requires a config file that's trickier to bootstrap in a container).
+    os.environ["GH_TOKEN"] = gh_token
     subprocess.run(["git", "config", "--global", "user.email", "legion@holyclaude.local"], check=True)
     subprocess.run(["git", "config", "--global", "user.name", "HolyClaude Legion"], check=True)
-    step("configured gh + git")
+    step("configured gh + git (token in env)")
 
     # ---------------------------------------------------------------
-    # 2. Clone the target repo
+    # 2. Clone the target repo — token embedded in URL so both clone
+    #    and push work without a credential helper.
     # ---------------------------------------------------------------
+    import re as _re
+    authed_url = _re.sub(
+        r"^https://(?:[^@/]+@)?",
+        f"https://x-access-token:{gh_token}@",
+        repo_url,
+    )
+
     Path("/workspace").mkdir(parents=True, exist_ok=True)
     if Path(WORKSPACE).exists():
-        # Cached from a previous run of this task-id — just refresh.
+        # Cached from a previous run of this task-id — refresh.
+        subprocess.run(["git", "remote", "set-url", "origin", authed_url], cwd=WORKSPACE, check=False)
         subprocess.run(["git", "fetch", "origin", base_branch], cwd=WORKSPACE, check=True)
         subprocess.run(["git", "checkout", base_branch], cwd=WORKSPACE, check=True)
         subprocess.run(["git", "reset", "--hard", f"origin/{base_branch}"], cwd=WORKSPACE, check=True)
         step(f"refreshed cached worktree at {WORKSPACE}")
     else:
-        subprocess.run(["git", "clone", repo_url, WORKSPACE], check=True)
+        subprocess.run(["git", "clone", authed_url, WORKSPACE], check=True)
         subprocess.run(["git", "checkout", base_branch], cwd=WORKSPACE, check=True)
-        step(f"cloned {repo_url} -> {WORKSPACE}")
+        step(f"cloned -> {WORKSPACE}")
 
     branch_name = f"{branch_prefix}{task_id}"
     subprocess.run(["git", "checkout", "-B", branch_name], cwd=WORKSPACE, check=True)
