@@ -40,7 +40,9 @@ import modal
 # ======================================================================
 
 HOLYCLAUDE_REPO = "https://github.com/ajsai47/holyclaude.git"
-HOLYCLAUDE_REF = "main"
+# Pinned to avoid silent upstream changes breaking cloud workers.
+# Bump intentionally; see docs/UPGRADING_HOLYCLAUDE.md (TODO).
+HOLYCLAUDE_REF = "b80d41f0cf39"
 NODE_MAJOR = "20"
 PLAYWRIGHT_VERSION = "1.48.0"
 

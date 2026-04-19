@@ -1,5 +1,53 @@
 # holyclaude-cloud — phase status
 
+---
+
+## 🏷️ v0.1.0 — session handoff (2026-04-19)
+
+Polished to a shareable tagged release. See [CHANGELOG.md](CHANGELOG.md) for the
+release summary and [README.md](README.md) for install + quickstart.
+
+### What's live
+
+- Phases 1–4 core product
+- Phase 5b review gate (calibrated on 3 scenarios + 1 adversarial test)
+- Phase 5a v1 decomposition subgraph
+- 2 successful dogfood rounds on this repo's own main (unit tests + CI)
+- 4 PRs merged by legion into its own codebase
+- `HOLYCLAUDE_REF` pinned to `b80d41f0cf39`
+
+### Known untested paths (priority-ordered for next session)
+
+1. **Phase 5c — learning brain.** Shared Modal volume is mounted but no code
+   reads/writes retrospectives. Biggest structural gap from PLAN.md still open.
+2. **CI re-dispatch end-to-end.** Code path exists (`cmd_reconcile` handles
+   `ci_failed`). Never fired because all dogfood CI runs passed. Needs a task
+   that produces failing tests to actually exercise the re-dispatch.
+3. **`auth_mode = "api"`.** Setup pushes the secret; workers have the code
+   path; never run end-to-end with a real key.
+4. **`/legion-start --resume`.** Described in orchestrator skill; never tested
+   against an actually-interrupted run.
+5. **Branch-protected main.** `gh pr merge --squash` will fail; reconciler
+   needs a "needs human review" blocker path.
+6. **Pre-commit hooks in the target repo.** Worker has no awareness; `git
+   commit` will fail if hooks reject the diff.
+
+### Concrete first step for next session
+
+Either:
+- **Push into 5c** (biggest structural move; see [PLAN.md](PLAN.md))
+- **OR deliberately trigger CI re-dispatch** (smallest bounded validation) —
+  see Path B in end-of-session ranked recommendation
+- **OR cross-repo dogfood** — run legion on a different one of your real
+  projects to find what breaks on contact with real constraints (CLAUDE.md,
+  CI, branch protection, codeowners)
+
+My recommendation coming out of this session: run the cross-repo dogfood
+first. It's the best predictor of "is this actually useful?" — and any
+surprising breakage would reprioritize the Phase 5 roadmap.
+
+---
+
 ## Phase 1 — Single-worker happy path  ✅ shipped
 
 - [x] Repo scaffold + plugin manifest
