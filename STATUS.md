@@ -27,13 +27,36 @@ Real working code for concurrent dispatch, atomic state, throttle-aware cap.
 - [x] Local worker: `git worktree` + subprocess `claude -p` + commit/push/PR post-exit
 - [x] End-to-end smoke test on fake 3-task graph: init → ready → route → status → scale → cap → stop → cost all pass
 
-## Phase 3 — Reconciler + mediator (next)
+## Phase 3 — Reconciler + mediator  ✅ shipped
 
-- [ ] Reconciler skill: PR dependency graph, ordered merges
-- [ ] Mediator agent: resolve conflicts by reading both diffs and rewriting the loser's branch
-- [ ] Auto-merge when CI passes
-- [ ] Re-dispatch on test failure (swap the failing task back into the queue with failure log as new context)
-- [ ] Resume support: `/legion-start --resume` reads existing `.legion/state.json` and continues
+- [x] `lib/reconciler.py` — `ready_to_merge`, `check_ci`, `merge_pr`,
+      `wait_for_mergeable`, `auto_heal` (stale-state self-repair)
+- [x] `lib/mediator.py` — fresh worktree off main, forced merge to expose
+      conflict markers, framed prompt (preserve both intents), claude -p,
+      post-exit commit + force-push to task branch
+- [x] Dependency-ordered merge via `ready_to_merge` (only merges tasks
+      whose deps are all merged)
+- [x] CI integration via `gh pr checks` — pending/fail/pass/none
+- [x] Conflict detection + mediator invocation + retry merge
+- [x] `wait_for_mergeable` polling (solves the UNKNOWN-state-after-force-push
+      race with GitHub)
+- [x] `mediator_attempts` tracked; retry cap via `legion.toml`
+- [x] Benign gh_error recovery (local branch delete with active worktree)
+- [x] Auto-heal: stale blockers cleared when PR is actually merged on GitHub
+- [x] New CLI: `legion reconcile`, `legion mediate <task-id>`
+- [x] New command: `/legion-reconcile [--loop]`
+- [x] New skill: `skills/reconciler/SKILL.md`
+- [x] **Live-tested conflict resolution:** two tasks edited the same README
+      lines with incompatible changes; one merged, the second hit conflict,
+      the mediator synthesized both intents ("apples & bananas"),
+      force-pushed, retry merged. Main has the combined result.
+
+## Phase 3b — deferred to Phase 4
+
+- [ ] CI re-dispatch on test failure (put failing task back in the queue
+      with the failure log as new context)
+- [ ] Resume support: `/legion-start --resume` reads existing
+      `.legion/state.json` and continues mid-run
 
 ## Phase 4 — Polish
 

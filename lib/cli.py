@@ -404,11 +404,33 @@ def cmd_reconcile(args) -> int:
     """One reconciliation pass. Idempotent — safe to call on a tick."""
     s = state.read_state()
     cfg = load_config()
+
+    # Auto-heal stale state first: any "blocked" or "shipped but not merged"
+    # task whose PR is actually merged on GitHub gets cleaned up.
+    healed = reconciler.auto_heal(s)
+    if healed:
+        heal_ids = {h["task_id"] for h in healed}
+        def _heal_mut(run: state.RunState, ids=heal_ids):
+            now = time.time()
+            for tid in ids:
+                t = run.tasks[tid]
+                t.merge_blocker = None
+                t.error = None
+                if t.merged_at is None:
+                    t.merged_at = now
+                run.events.append({
+                    "ts": now, "kind": "auto_healed", "task_id": tid,
+                })
+        state.update_state(_heal_mut)
+        s = state.read_state()
+
     ready = reconciler.ready_to_merge(s)
     results = []
+    if healed:
+        results.append({"auto_healed": healed})
 
     if not ready:
-        print(json.dumps({"action": "idle", "ready_count": 0}, indent=2))
+        print(json.dumps({"action": "idle", "ready_count": 0, "auto_healed": healed}, indent=2))
         return 0
 
     for task in ready:
@@ -460,6 +482,10 @@ def cmd_reconcile(args) -> int:
             state.update_state(_mut)
 
             if med["status"] in ("resolved", "no_conflict"):
+                # Let GitHub recompute mergeability after the force-push.
+                # Without this, mergeable is UNKNOWN and retry immediately
+                # fails with "not mergeable".
+                reconciler.wait_for_mergeable(task.pr_url, timeout_s=45)
                 # Retry merge
                 mr2 = reconciler.merge_pr(task)
                 if mr2["status"] == "merged":
@@ -485,14 +511,16 @@ def cmd_reconcile(args) -> int:
                 })
             continue
 
-        # 4. Other merge failure
+        # 4. Other merge failure — not sticky. Next reconcile tick will retry,
+        # which runs the _pr_is_merged upfront check to auto-heal if the PR
+        # actually merged on GitHub's side.
         def _mut(run: state.RunState, tid=task.id, err=mr.get("error", "")):
-            run.tasks[tid].merge_blocker = "gh_error"
             run.tasks[tid].error = err[:500]
         state.update_state(_mut)
         results.append({
             "task_id": task.id,
             "status": mr["status"],
+            "will_retry": True,
             "error": mr.get("error", "")[:200],
         })
 
