@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import dispatch, governor, routing, state
+from . import dispatch, governor, mediator, reconciler, routing, state
 from .config import load as load_config
 
 
@@ -397,6 +397,136 @@ def cmd_cap(_args) -> int:
 
 
 # ----------------------------------------------------------------------
+# reconcile — merge shipped PRs in dep order, invoke mediator on conflict
+# ----------------------------------------------------------------------
+
+def cmd_reconcile(args) -> int:
+    """One reconciliation pass. Idempotent — safe to call on a tick."""
+    s = state.read_state()
+    cfg = load_config()
+    ready = reconciler.ready_to_merge(s)
+    results = []
+
+    if not ready:
+        print(json.dumps({"action": "idle", "ready_count": 0}, indent=2))
+        return 0
+
+    for task in ready:
+        # 1. CI check
+        ci = reconciler.check_ci(task.pr_url)
+        if ci == "pending":
+            results.append({"task_id": task.id, "status": "ci_pending"})
+            continue
+        if ci == "fail":
+            def _mut(run: state.RunState, tid=task.id):
+                run.tasks[tid].merge_blocker = "ci_failed"
+                run.events.append({
+                    "ts": time.time(), "kind": "merge_blocked",
+                    "task_id": tid, "reason": "ci_failed",
+                })
+            state.update_state(_mut)
+            results.append({"task_id": task.id, "status": "ci_failed"})
+            continue
+
+        # 2. Attempt merge
+        mr = reconciler.merge_pr(task)
+        if mr["status"] == "merged":
+            def _mut(run: state.RunState, tid=task.id):
+                run.tasks[tid].merged_at = time.time()
+                run.events.append({
+                    "ts": time.time(), "kind": "merged", "task_id": tid,
+                })
+            state.update_state(_mut)
+            results.append({"task_id": task.id, "status": "merged"})
+            continue
+
+        if mr["status"] == "conflict":
+            # 3. Mediate
+            if task.mediator_attempts >= cfg.reconciler.mediator_max_retries:
+                def _mut(run: state.RunState, tid=task.id):
+                    run.tasks[tid].merge_blocker = "mediator_maxed"
+                state.update_state(_mut)
+                results.append({"task_id": task.id, "status": "mediator_maxed"})
+                continue
+
+            med = mediator.run_mediator(task, s.base_branch)
+
+            def _mut(run: state.RunState, tid=task.id):
+                run.tasks[tid].mediator_attempts += 1
+                run.events.append({
+                    "ts": time.time(), "kind": "mediator_run",
+                    "task_id": tid, "result": med.get("status"),
+                })
+            state.update_state(_mut)
+
+            if med["status"] in ("resolved", "no_conflict"):
+                # Retry merge
+                mr2 = reconciler.merge_pr(task)
+                if mr2["status"] == "merged":
+                    def _mut(run: state.RunState, tid=task.id):
+                        run.tasks[tid].merged_at = time.time()
+                        run.events.append({
+                            "ts": time.time(), "kind": "merged",
+                            "task_id": tid, "via": "mediator",
+                        })
+                    state.update_state(_mut)
+                    results.append({"task_id": task.id, "status": "mediated_and_merged"})
+                else:
+                    results.append({
+                        "task_id": task.id,
+                        "status": "mediation_ok_merge_failed",
+                        "merge_detail": mr2,
+                    })
+            else:
+                results.append({
+                    "task_id": task.id,
+                    "status": "mediation_failed",
+                    "detail": med,
+                })
+            continue
+
+        # 4. Other merge failure
+        def _mut(run: state.RunState, tid=task.id, err=mr.get("error", "")):
+            run.tasks[tid].merge_blocker = "gh_error"
+            run.tasks[tid].error = err[:500]
+        state.update_state(_mut)
+        results.append({
+            "task_id": task.id,
+            "status": mr["status"],
+            "error": mr.get("error", "")[:200],
+        })
+
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------
+# mediate <task-id> — manually invoke the mediator
+# ----------------------------------------------------------------------
+
+def cmd_mediate(args) -> int:
+    s = state.read_state()
+    task = s.tasks.get(args.task_id)
+    if not task:
+        print(f"error: no task {args.task_id}", file=sys.stderr)
+        return 1
+    if not task.branch or not task.pr_url:
+        print(f"error: task {task.id} has no branch/PR to mediate", file=sys.stderr)
+        return 1
+    result = mediator.run_mediator(task, s.base_branch)
+    def _mut(run: state.RunState, tid=task.id):
+        run.tasks[tid].mediator_attempts += 1
+        run.events.append({
+            "ts": time.time(), "kind": "mediator_run",
+            "task_id": tid, "manual": True,
+            "result": result.get("status"),
+        })
+    state.update_state(_mut)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") in ("resolved", "no_conflict") else 2
+
+
+# ----------------------------------------------------------------------
 # cleanup (idempotent reset)
 # ----------------------------------------------------------------------
 
@@ -509,6 +639,13 @@ def main(argv: list[str] | None = None) -> int:
     p_clean.add_argument("--all", action="store_true",
                          help="Also rm -rf .legion/ (wipes run state)")
     p_clean.set_defaults(func=cmd_cleanup)
+
+    p_rec = sub.add_parser("reconcile", help="Run one reconciliation pass (merge ready PRs, mediate conflicts)")
+    p_rec.set_defaults(func=cmd_reconcile)
+
+    p_med = sub.add_parser("mediate", help="Manually invoke the mediator on a task")
+    p_med.add_argument("task_id")
+    p_med.set_defaults(func=cmd_mediate)
 
     args = p.parse_args(argv)
     return args.func(args)

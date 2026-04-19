@@ -65,6 +65,11 @@ class Task:
     finished_at: float | None = None
     error: str | None = None
 
+    # Reconciler fields
+    merged_at: float | None = None
+    merge_blocker: str | None = None    # "ci_failed" | "mediator_maxed" | "needs_human"
+    mediator_attempts: int = 0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
