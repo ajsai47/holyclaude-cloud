@@ -61,15 +61,30 @@ secret_exists() {
 }
 
 CREDS_JSON=""
+CREDS_SOURCE=""
 if [[ "$(uname)" == "Darwin" ]]; then
-    CREDS_JSON="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null || true)"
+    # Claude Code 2.1.x+ stores session creds in macOS Keychain.
+    # Service: "Claude Code-credentials", account: macOS username.
+    CREDS_JSON="$(security find-generic-password -s 'Claude Code-credentials' -a "$(whoami)" -w 2>/dev/null || true)"
+    [[ -n "$CREDS_JSON" ]] && CREDS_SOURCE="macOS Keychain"
 fi
 if [[ -z "$CREDS_JSON" && -f "$HOME/.claude/.credentials.json" ]]; then
+    # Legacy file-based creds (pre-migration Claude Code).
     CREDS_JSON="$(cat "$HOME/.claude/.credentials.json")"
+    CREDS_SOURCE="$HOME/.claude/.credentials.json"
 fi
 if [[ -z "$CREDS_JSON" ]]; then
-    echo "setup: could not locate Claude credentials." >&2
-    echo "  Log into Claude Code first." >&2
+    echo "setup: could not locate Claude Pro session credentials." >&2
+    if [[ "$(uname)" == "Darwin" ]]; then
+        echo "  Checked:" >&2
+        echo "    - macOS Keychain entry 'Claude Code-credentials' (account $(whoami)): not found" >&2
+        echo "    - Legacy file $HOME/.claude/.credentials.json: not found" >&2
+        echo "  Fix: run 'claude' interactively, log in to your Pro account, then re-run setup." >&2
+    else
+        echo "  Checked: $HOME/.claude/.credentials.json — not found." >&2
+        echo "  Fix: run 'claude' interactively, log in, then re-run setup." >&2
+    fi
+    echo "  Alternative: switch legion.toml [swarm] auth_mode = \"api\" and export ANTHROPIC_API_KEY." >&2
     exit 1
 fi
 if ! python3 -c "
@@ -77,9 +92,12 @@ import json,sys
 d = json.loads(sys.stdin.read())
 assert 'claudeAiOauth' in d and 'accessToken' in d['claudeAiOauth']
 " <<< "$CREDS_JSON" >/dev/null 2>&1; then
-    echo "setup: credentials payload missing claudeAiOauth.accessToken" >&2
+    echo "setup: credentials payload from $CREDS_SOURCE is missing claudeAiOauth.accessToken." >&2
+    echo "  The stored blob may be corrupt or from an incompatible Claude Code version." >&2
+    echo "  Try: log out + log back in to Claude Code, then re-run setup." >&2
     exit 1
 fi
+echo "setup: found Claude Pro session creds in $CREDS_SOURCE"
 
 echo "setup: pushing claude-pro-session secret"
 "$MODAL_BIN" secret delete claude-pro-session --yes >/dev/null 2>&1 || true
