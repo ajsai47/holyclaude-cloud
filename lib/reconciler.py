@@ -146,6 +146,21 @@ def fetch_ci_failure(pr_url: str | None) -> str:
     return "\n".join(lines)
 
 
+def _get_merge_state(num: str) -> str:
+    """Synchronous query of GitHub's mergeStateStatus.
+    Returns UNKNOWN on any failure."""
+    result = subprocess.run(
+        ["gh", "pr", "view", num, "--json", "mergeStateStatus"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout).get("mergeStateStatus", "UNKNOWN")
+        except Exception:
+            pass
+    return "UNKNOWN"
+
+
 def merge_pr(task: Task) -> dict:
     """Attempt to merge task's PR. Returns a result dict."""
     num = pr_number(task.pr_url)
@@ -172,7 +187,35 @@ def merge_pr(task: Task) -> dict:
         if _pr_is_merged(num):
             return {"status": "merged", "note": "local branch delete skipped"}
 
-    if "conflict" in err or "not mergeable" in err or "merge conflict" in err:
+    # Disambiguate failure modes via GitHub's mergeStateStatus. `gh pr merge`
+    # prints "not mergeable" for BOTH real merge conflicts (DIRTY) and
+    # branch-protection blocks (BLOCKED) — string-matching alone wrongly
+    # invoked the mediator on branch-protected repos.
+    merge_state = _get_merge_state(num)
+    if merge_state == "BLOCKED":
+        return {
+            "status": "needs_human",
+            "error": result.stderr or result.stdout,
+            "merge_state": merge_state,
+        }
+    if merge_state == "DIRTY":
+        return {
+            "status": "conflict",
+            "error": result.stderr or result.stdout,
+            "merge_state": merge_state,
+        }
+    if merge_state == "UNSTABLE":
+        return {
+            "status": "ci_blocked",
+            "error": result.stderr or result.stdout,
+            "merge_state": merge_state,
+        }
+
+    # Fallback: legacy pattern matching for states we couldn't read. Note
+    # we intentionally dropped "not mergeable" from the conflict signature
+    # here — that phrase collides with BLOCKED, and if we reach this fallback
+    # we don't know which it is. Prefer the DIRTY/BLOCKED disambiguation above.
+    if "merge conflict" in err or ("conflict" in err and "merge" in err):
         return {"status": "conflict", "error": result.stderr or result.stdout}
     if "check" in err and ("fail" in err or "pending" in err):
         return {"status": "ci_blocked", "error": result.stderr or result.stdout}

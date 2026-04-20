@@ -619,6 +619,47 @@ def cmd_reconcile(args) -> int:
             results.append({"task_id": task.id, "status": "merged"})
             continue
 
+        if mr["status"] == "needs_human":
+            # Branch-protected main or similar BLOCKED state. Mediator
+            # can't help (there's no conflict to resolve) — stop here and
+            # let a human approve/unblock the PR.
+            def _mut(
+                run: state.RunState,
+                tid=task.id,
+                err=mr.get("error", ""),
+                merge_state=mr.get("merge_state", ""),
+            ):
+                run.tasks[tid].merge_blocker = "needs_human"
+                run.tasks[tid].error = (err or "")[:500]
+                run.events.append({
+                    "ts": time.time(), "kind": "merge_blocked",
+                    "task_id": tid, "reason": "branch_protection",
+                    "merge_state": merge_state,
+                })
+            state.update_state(_mut)
+
+            if task.pr_url:
+                reviewer.post_pr_comment(
+                    task.pr_url,
+                    (
+                        "### Legion merge blocked — needs human review\n\n"
+                        "This PR is ready to merge but the base branch is "
+                        "protected. Likely causes: required approvals from "
+                        "CODEOWNERS, or a required status check that hasn't "
+                        "passed.\n\n"
+                        f"GitHub mergeStateStatus: `{mr.get('merge_state', 'UNKNOWN')}`\n\n"
+                        f"gh error: `{(mr.get('error') or '').strip()[:300]}`\n\n"
+                        "_Approve + merge manually, or resolve the blocker "
+                        "and the next reconcile pass will auto-heal._"
+                    ),
+                )
+            results.append({
+                "task_id": task.id,
+                "status": "needs_human",
+                "merge_state": mr.get("merge_state"),
+            })
+            continue
+
         if mr["status"] == "conflict":
             # 3. Mediate
             if task.mediator_attempts >= cfg.reconciler.mediator_max_retries:
@@ -788,6 +829,80 @@ def cmd_decompose_refine(args) -> int:
 # run — autonomous dispatch + reconcile loop
 # ----------------------------------------------------------------------
 
+def render_run_summary(s: "state.RunState", say) -> int:
+    """Print the final summary for a legion run and return an exit code.
+
+    Every task is tallied into exactly one terminal category so the grand
+    total matches len(s.tasks). Non-zero exit code is returned if any task
+    ended in a worker/runtime failure, was blocked from merging, or was
+    cancelled.
+
+    Parameters
+    ----------
+    s: state.RunState
+        The final run state to summarize.
+    say: Callable[[str], None]
+        Output sink (e.g. cmd_run's _say that respects --quiet).
+    """
+    tasks = list(s.tasks.values())
+
+    merged = [t for t in tasks if t.status == "shipped" and t.merged_at is not None]
+    # "shipped" but not merged and not otherwise blocked — these are PRs
+    # still awaiting merge (e.g. run exited before reconciler landed them).
+    shipped_open = [
+        t for t in tasks
+        if t.status == "shipped" and t.merged_at is None and not t.merge_blocker
+    ]
+    blocked = [t for t in tasks if t.merge_blocker is not None]
+    failed = [
+        t for t in tasks
+        if t.status in ("failed", "claude_failed") and not t.merge_blocker
+    ]
+    no_changes = [t for t in tasks if t.status == "no_changes"]
+    cancelled = [t for t in tasks if t.status == "cancelled"]
+
+    # Anything not in a terminal state above (pending / ready / in_flight)
+    # — should be zero on a clean exit, but surface it if non-zero.
+    terminal_ids = {
+        t.id for t in (*merged, *shipped_open, *blocked, *failed, *no_changes, *cancelled)
+    }
+    other = [t for t in tasks if t.id not in terminal_ids]
+
+    say("")
+    say("LEGION RUN COMPLETE")
+    say(f"  Merged:     {len(merged)}")
+    say(f"  Shipped:    {len(shipped_open)} (PR open, not yet merged)")
+    say(f"  Blocked:    {len(blocked)}")
+    say(f"  Failed:     {len(failed)}")
+    say(f"  No changes: {len(no_changes)}")
+    say(f"  Cancelled:  {len(cancelled)}")
+    if other:
+        say(f"  Other:      {len(other)} (non-terminal)")
+    total = (
+        len(merged) + len(shipped_open) + len(blocked)
+        + len(failed) + len(no_changes) + len(cancelled) + len(other)
+    )
+    say(f"  Total:      {total}")
+
+    for t in merged:
+        if t.pr_url:
+            say(f"    \u2713 {t.id}: {t.pr_url}")
+    for t in blocked:
+        reason = t.merge_blocker or "blocked"
+        say(f"    \u26a0 {t.id}: {reason[:120]}")
+    for t in failed:
+        reason = t.error or t.status or "unknown"
+        say(f"    \u2717 {t.id}: {reason[:120]}")
+    for t in cancelled:
+        say(f"    \u29d7 {t.id}: cancelled")
+
+    # Non-zero exit when any task ended in a non-success terminal state
+    # that indicates human attention is needed.
+    if failed or blocked or cancelled:
+        return 2
+    return 0
+
+
 def cmd_run(args) -> int:
     """Autonomous loop: dispatch ready tasks, poll in-flight, reconcile shipped.
 
@@ -941,24 +1056,11 @@ def cmd_run(args) -> int:
 
     # Final summary
     s = state.read_state()
-    shipped = [t for t in s.tasks.values() if t.status == "shipped"]
-    merged = [t for t in s.tasks.values() if t.merged_at is not None]
-    failed = [t for t in s.tasks.values() if t.status == "failed" or t.merge_blocker]
-    _say("")
-    _say(f"LEGION RUN COMPLETE")
-    _say(f"  Merged:   {len(merged)}")
-    _say(f"  Shipped:  {len(shipped)} (of which {len(merged)} merged)")
-    _say(f"  Failed:   {len(failed)}")
-    for t in merged:
-        if t.pr_url:
-            _say(f"    ✓ {t.id}: {t.pr_url}")
-    for t in failed:
-        reason = t.merge_blocker or t.error or "unknown"
-        _say(f"    ✗ {t.id}: {reason[:120]}")
+    exit_code = render_run_summary(s, _say)
 
     # Clear stop marker on clean exit
     state.clear_stop()
-    return 0 if not failed else 2
+    return exit_code
 
 
 def _silent_poll(_s):
