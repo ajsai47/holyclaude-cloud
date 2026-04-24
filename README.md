@@ -52,19 +52,27 @@ End-to-end validated on its own repo ("dogfood") plus a sandbox. Ships PRs that 
 ## Install
 
 ```bash
-git clone https://github.com/ajsai47/holyclaude-cloud.git ~/holyclaude-cloud
-cd ~/holyclaude-cloud
+git clone https://github.com/ajsai47/holyclaude-cloud
+cd holyclaude-cloud
+pip install -e .
 ./setup
 ```
 
+`pip install -e .` puts `legion` on your PATH as a proper console script.  
+Re-run setup any time creds rotate.
+
+**Reproducible local install** (pins matching the Modal worker image):
+
+```bash
+pip install -r requirements.txt
+```
+
 The setup script:
-1. Finds your Modal CLI (expects `/Users/ajsai47/tinker-env/bin/modal`, falls back to PATH)
+1. Finds your Modal CLI (looks on PATH first, then common venv locations)
 2. Verifies Modal auth
 3. Extracts Claude Pro session creds from macOS keychain (or `~/.claude/.credentials.json`) and pushes as the `claude-pro-session` Modal secret
 4. Reads `gh auth token` (or `$GITHUB_TOKEN`) and pushes as the `legion-github` Modal secret
 5. Pushes a placeholder `anthropic-api-key` secret (the `--api` escape hatch requires the real key; see below)
-
-Re-run setup any time creds rotate.
 
 ## Quickstart
 

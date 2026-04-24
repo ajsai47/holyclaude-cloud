@@ -13,9 +13,9 @@ cd "$REPO_ROOT"
 # 1. Locate Modal CLI
 # ---------------------------------------------------------------------
 MODAL_BIN_CANDIDATES=(
-    "/Users/ajsai47/tinker-env/bin/modal"
-    "$HOME/tinker-env/bin/modal"
     "$(command -v modal 2>/dev/null || true)"
+    "$HOME/tinker-env/bin/modal"
+    "/Users/ajsai47/tinker-env/bin/modal"
 )
 MODAL_BIN=""
 for cand in "${MODAL_BIN_CANDIDATES[@]}"; do

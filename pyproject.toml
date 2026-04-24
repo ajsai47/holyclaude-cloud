@@ -1,3 +1,21 @@
+[project]
+name = "holyclaude-cloud"
+version = "0.2.0"
+description = "Claude Code multi-agent dispatcher built on Modal — decompose goals into task DAGs, dispatch parallel workers, merge cleanly."
+requires-python = ">=3.11"
+dependencies = [
+    "modal",
+    "httpx",
+    "rich",
+    "tomli",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+legion = "lib.cli:main"
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
