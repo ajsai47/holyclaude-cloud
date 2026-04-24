@@ -9,13 +9,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+# Track what was configured vs skipped for the final summary.
+_summary_configured=()
+_summary_skipped=()
+
 # ---------------------------------------------------------------------
 # 1. Locate Modal CLI
 # ---------------------------------------------------------------------
 MODAL_BIN_CANDIDATES=(
-    "/Users/ajsai47/tinker-env/bin/modal"
-    "$HOME/tinker-env/bin/modal"
     "$(command -v modal 2>/dev/null || true)"
+    "$HOME/tinker-env/bin/modal"
+    "/Users/ajsai47/tinker-env/bin/modal"
 )
 MODAL_BIN=""
 for cand in "${MODAL_BIN_CANDIDATES[@]}"; do
@@ -36,7 +40,9 @@ echo "setup: modal CLI -> $MODAL_BIN"
 # ---------------------------------------------------------------------
 if ! "$MODAL_BIN" token current >/dev/null 2>&1 \
    && ! "$MODAL_BIN" profile current >/dev/null 2>&1; then
-    echo "setup: modal not authenticated. Run: $MODAL_BIN token new" >&2
+    echo "setup: modal not authenticated." >&2
+    echo "  Run: $MODAL_BIN token new" >&2
+    echo "  This opens a browser — log in and your token is saved automatically." >&2
     exit 1
 fi
 echo "setup: modal auth OK"
@@ -52,6 +58,22 @@ else
     echo "  (Cloud workers don't need it locally — they get HolyClaude from the image clone."
     echo "   But your local orchestrator does.)"
 fi
+
+# ---------------------------------------------------------------------
+# Helper: write a secret via temp file so values never appear on CLI args.
+# Usage: _push_secret <secret-name> <KEY> <value>
+# ---------------------------------------------------------------------
+_push_secret_kv() {
+    local secret_name="$1"
+    local key="$2"
+    local value="$3"
+    local _tmpf
+    _tmpf="$(mktemp)"
+    chmod 600 "$_tmpf"
+    printf '%s=%s\n' "$key" "$value" > "$_tmpf"
+    "$MODAL_BIN" secret create "$secret_name" --from-dotenv "$_tmpf" --force
+    rm -f "$_tmpf"
+}
 
 # ---------------------------------------------------------------------
 # 4. Push Claude Pro session secret
@@ -101,8 +123,8 @@ echo "setup: found Claude Pro session creds in $CREDS_SOURCE"
 
 echo "setup: pushing claude-pro-session secret"
 "$MODAL_BIN" secret delete claude-pro-session --yes >/dev/null 2>&1 || true
-"$MODAL_BIN" secret create claude-pro-session \
-    CLAUDE_CREDENTIALS_JSON="$CREDS_JSON"
+_push_secret_kv claude-pro-session CLAUDE_CREDENTIALS_JSON "$CREDS_JSON"
+_summary_configured+=("claude-pro-session  (Claude Pro session credentials)")
 
 # ---------------------------------------------------------------------
 # 5. Push GitHub token secret
@@ -116,15 +138,19 @@ if [[ -z "$GH_TOKEN" && -n "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 if [[ -z "$GH_TOKEN" ]]; then
-    echo "setup: WARNING — no GitHub token found."
-    echo "  Workers won't be able to push branches or open PRs."
-    echo "  Fix: gh auth login   OR   export GITHUB_TOKEN=ghp_..."
-else
-    echo "setup: pushing legion-github secret"
-    "$MODAL_BIN" secret delete legion-github --yes >/dev/null 2>&1 || true
-    "$MODAL_BIN" secret create legion-github \
-        GITHUB_TOKEN="$GH_TOKEN"
+    echo "setup: ERROR — no GitHub token found." >&2
+    echo "  Workers need a GitHub token to push branches and open PRs." >&2
+    echo "  Fix (pick one):" >&2
+    echo "    gh auth login" >&2
+    echo "    export GITHUB_TOKEN=ghp_..." >&2
+    echo "  Then re-run setup." >&2
+    exit 1
 fi
+
+echo "setup: pushing legion-github secret"
+"$MODAL_BIN" secret delete legion-github --yes >/dev/null 2>&1 || true
+_push_secret_kv legion-github GITHUB_TOKEN "$GH_TOKEN"
+_summary_configured+=("legion-github       (GitHub token for branch push / PR)")
 
 # ---------------------------------------------------------------------
 # 5b. Push Anthropic API key secret (for auth_mode="api" escape hatch)
@@ -132,8 +158,8 @@ fi
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     echo "setup: pushing anthropic-api-key secret (real key — escape hatch enabled)"
     "$MODAL_BIN" secret delete anthropic-api-key --yes >/dev/null 2>&1 || true
-    "$MODAL_BIN" secret create anthropic-api-key \
-        ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+    _push_secret_kv anthropic-api-key ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+    _summary_configured+=("anthropic-api-key   (real key; auth_mode=api enabled)")
 else
     # Still push a placeholder — Modal attaches secrets at decorator time,
     # not at runtime, so the worker function body won't load at all if this
@@ -142,10 +168,12 @@ else
     if ! "$MODAL_BIN" secret list 2>/dev/null | awk '{print $2}' | grep -Fxq "anthropic-api-key"; then
         echo "setup: no ANTHROPIC_API_KEY in env — pushing placeholder anthropic-api-key"
         echo "  (decorator needs the secret to exist; auth_mode=session ignores the value)"
-        "$MODAL_BIN" secret create anthropic-api-key \
-            ANTHROPIC_API_KEY="placeholder-run-setup-with-ANTHROPIC_API_KEY-set-to-enable-api-mode"
+        _push_secret_kv anthropic-api-key ANTHROPIC_API_KEY \
+            "placeholder-run-setup-with-ANTHROPIC_API_KEY-set-to-enable-api-mode"
+        _summary_skipped+=("anthropic-api-key   (placeholder pushed; set ANTHROPIC_API_KEY to enable api mode)")
     else
         echo "setup: anthropic-api-key secret already exists — not touching it"
+        _summary_skipped+=("anthropic-api-key   (already exists; not changed)")
     fi
 fi
 
@@ -159,10 +187,26 @@ if [[ ! -f "./legion.toml" && ! -f "$PWD/legion.toml" ]]; then
 fi
 
 # ---------------------------------------------------------------------
-# 7. Optional: pre-build the image so first /legion-start isn't slow
+# 7. Final summary
 # ---------------------------------------------------------------------
 echo ""
-echo "setup: ready."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  setup complete"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [[ ${#_summary_configured[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Configured:"
+    for item in "${_summary_configured[@]}"; do
+        echo "    [ok] $item"
+    done
+fi
+if [[ ${#_summary_skipped[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Skipped / unchanged:"
+    for item in "${_summary_skipped[@]}"; do
+        echo "    [-]  $item"
+    done
+fi
 echo ""
 echo "Next steps:"
 echo "  1. cd into the repo you want to swarm against."
