@@ -36,8 +36,9 @@ worker_timeout_minutes = 30
 # escalating to the human.
 mediator_max_retries = 2
 
-# GitHub repo to push branches/PRs to. If empty, inferred from `git remote`.
-github_repo = ""
+# github_repo is auto-detected from `git remote get-url origin` — no need to set this.
+# Override only if your remote URL doesn't point to the right repo.
+# github_repo = "owner/repo"
 
 # Branch prefix for legion-spawned branches.
 branch_prefix = "legion/"

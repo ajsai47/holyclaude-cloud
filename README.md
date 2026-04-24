@@ -60,6 +60,8 @@ pip install -e .      # puts `legion` on PATH
 ./setup               # pushes secrets to Modal, verifies auth
 ```
 
+> **First run:** Modal builds the worker image on first use (~12 min, one time). Subsequent runs start in seconds.
+
 `setup` will check your Python version and exit with a clear message if it's wrong.  
 Re-run `./setup` any time creds rotate.
 
@@ -99,7 +101,7 @@ The orchestrator skill will:
 
 ## What happens under the hood
 
-**First run** (of a repo): Modal builds the meta-on-meta image — Node 20, Bun, Playwright, the Claude Code CLI, HolyClaude at pinned `HOLYCLAUDE_REF`, gh CLI. ~10-15 minutes, one time. Subsequent runs reuse cached layers.
+**First run** (of a repo): Modal builds the meta-on-meta image (~12 minutes, one time per Modal account). This includes Node 20, Bun, Playwright, Claude Code CLI, HolyClaude, and gh. Subsequent runs reuse the cached image. **Expect to wait ~12 min before workers start on your first run.**
 
 **Every run**:
 - Local workers spawn as `subprocess.Popen` in `.legion/worktrees/<task-id>/`
@@ -108,6 +110,26 @@ The orchestrator skill will:
 - Reviewer runs on each shipped PR before merge — `critical` blocks + re-dispatches, `warnings` merges with PR comment, `clean` merges silently
 - Reconciler merges in dep order via `gh pr merge --squash`
 - Mediator kicks in on conflict — spawns a Claude worker on a fresh worktree with conflict markers, preserves both intents, force-pushes, retries merge
+
+## Branch protection & needs_human
+
+If your target repo requires PR reviews before merging (branch protection rules, CODEOWNERS), legion will open PRs and run CI but can't auto-merge them. Tasks hit `needs_human` status.
+
+**What you'll see at the end of a run:**
+```
+⚠ T-001: needs_human — approve and merge manually:
+    https://github.com/owner/repo/pull/1
+```
+
+**Options:**
+
+1. **Manual approval** — review and approve each PR in GitHub, then run `legion run` again to drain the queue. The reconciler will auto-heal and merge once approved.
+
+2. **Disable protection for legion's branch prefix** — in GitHub repo settings, add a branch protection exception for `legion/*` branches.
+
+3. **Bot account** — create a second GitHub account, add it as a repo collaborator, and have it approve legion's PRs. Set `GITHUB_TOKEN` in your shell to the bot's token before running `./setup`.
+
+4. **`--admin` merge** — if you're a repo admin: `gh pr merge <url> --squash --admin` bypasses protection. Useful for one-off runs but not scalable.
 
 ## Commands
 

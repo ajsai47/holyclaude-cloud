@@ -29,7 +29,6 @@ class BudgetConfig:
 @dataclass
 class ReconcilerConfig:
     mediator_max_retries: int = 2
-    github_repo: str = ""
     branch_prefix: str = "legion/"
 
 
