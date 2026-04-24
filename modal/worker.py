@@ -293,6 +293,16 @@ def _run_task_body(
         f"- If the task is unclear or impossible as specified, write your reasoning to .legion/blockers/{task_id}.md and stop.\n"
     )
 
+    # Disable target-repo .mcp.json before running claude — if any MCP server
+    # in the target repo's config fails to init (network, missing creds), Claude
+    # Code's startup errors out immediately. Workers run in containers without
+    # those credentials, so MCP init is CI's job, not the worker's.
+    mcp_json = Path(WORKSPACE) / ".mcp.json"
+    mcp_json_disabled = Path(WORKSPACE) / ".mcp.json.legion-disabled"
+    if mcp_json.exists():
+        mcp_json.rename(mcp_json_disabled)
+        step("renamed .mcp.json -> .mcp.json.legion-disabled (MCP servers disabled in worker containers; CI will validate them)")
+
     cmd = [
         "claude", "-p", framed_prompt,
         "--permission-mode", "bypassPermissions",
@@ -320,6 +330,11 @@ def _run_task_body(
         transcript.append(line)
     rc = proc.wait()
     step(f"claude exited rc={rc}")
+
+    # Restore .mcp.json if we disabled it above.
+    if mcp_json_disabled.exists():
+        mcp_json_disabled.rename(mcp_json)
+        step("restored .mcp.json")
 
     # Persist transcript to the cache volume for the orchestrator to read.
     cache_dir = Path(WORKER_CACHE_MOUNT) / task_id
@@ -358,10 +373,19 @@ def _run_task_body(
         })
 
     subprocess.run(["git", "add", "-A"], cwd=WORKSPACE, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", f"{task_id}: {title}"],
-        cwd=WORKSPACE, check=True,
-    )
+
+    # Skip pre-commit hooks if the target repo has them configured. Workers
+    # run in containers that lack the hook dependencies (linters, formatters,
+    # etc.). Hooks are CI's responsibility; --no-verify is safe here.
+    commit_cmd = ["git", "commit", "-m", f"{task_id}: {title}"]
+    if (Path(WORKSPACE) / ".pre-commit-config.yaml").exists():
+        commit_cmd.append("--no-verify")
+        step("target repo has .pre-commit-config.yaml — using --no-verify (hook deps not available in worker container; CI will enforce hooks on the PR)")
+        pr_full_body_hook_note = "\n> **Note:** pre-commit hooks were skipped during the worker commit (`--no-verify`). CI will enforce them on this PR.\n"
+    else:
+        pr_full_body_hook_note = ""
+
+    subprocess.run(commit_cmd, cwd=WORKSPACE, check=True)
     subprocess.run(
         ["git", "push", "-u", "origin", branch_name, "--force-with-lease"],
         cwd=WORKSPACE, check=True,
@@ -374,6 +398,7 @@ def _run_task_body(
         f"---\n"
         f"<!-- legion-task-id: {task_id} -->\n"
         f"Spawned by HolyClaude Legion. Worker container: `{os.environ.get('MODAL_TASK_ID', 'unknown')}`.\n"
+        f"{pr_full_body_hook_note}"
     )
     pr_create = subprocess.run(
         ["gh", "pr", "create",
