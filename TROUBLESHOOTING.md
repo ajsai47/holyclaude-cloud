@@ -39,6 +39,27 @@ Re-running with the same `task-id` will force-push the branch (via `--force-with
 
 ## Cloud workers specifically
 
+### Cloud workers fail with `claude_failed` (401 / authentication expired)
+
+**Symptom:** A cloud task shows `✗ T-001: claude_failed` with an error like _"Authentication failed (401). Your cloud session token has expired."_ The cloud log at `.legion/cloud_logs/<task-id>.log` contains `"error":"authentication_failed"` or `"api_error_status":401`.
+
+**Cause:** Claude Pro session tokens are short-lived (~hours). The token that `setup` pushed to the Modal `claude-pro-session` secret has expired.
+
+**Fix:**
+```bash
+cd ~/holyclaude-cloud
+./setup          # re-reads your local ~/.claude/.credentials.json and pushes to Modal
+```
+
+Then retry the failed task:
+```bash
+legion spawn T-001   # or let `legion run --resume` pick it up
+```
+
+**Why this happens:** `setup` snapshots your current Claude Code session credentials into a Modal secret. If you log out of Claude Code locally, or if the session token rotates, the snapshot goes stale. Re-running `./setup` refreshes the snapshot.
+
+If you're using `auth_mode = "api"` in `legion.toml`, this error means `ANTHROPIC_API_KEY` is unset or was pushed as a placeholder — export the real key and re-run `./setup`.
+
 ### `ModuleNotFoundError: No module named 'image'`
 Historic bug — pre-fix, image definition was in a sibling `image.py` that Modal didn't ship with the worker code. Post-fix: image is inlined into `modal/worker.py`. If you see this, you're running very old code; `git pull`.
 

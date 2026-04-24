@@ -2,6 +2,38 @@
 
 ---
 
+## v0.3.0 — GA polish (2026-04-24)
+
+### What shipped
+
+**Bug fixes (were silent blockers):**
+- `check_ci()` used nonexistent `conclusion` JSON field — always returned "none", making CI re-dispatch dead code. Fixed to use `bucket`/`state` fields from actual gh CLI output.
+- Stale `.legion/blockers/<id>.md` from previous run caused re-dispatched worker to immediately fail. Fixed: CI re-dispatch path and `spawn_local` both clear it.
+- 69/69 tests passing (1 was failing due to stale fixture using old `conclusion` field).
+
+**New commands:**
+- `legion doctor` — 7-check pre-flight: Claude Code CLI, gh auth, Modal CLI, both Modal secrets, legion.toml, git repo context.
+- `legion decompose "<goal>"` — plain-English → tasks.json via Claude. Removes the need to write JSON manually.
+
+**UX improvements:**
+- Rich live terminal dashboard in `legion run`: narrated ⚡/✓/✅/↩/⚠ events + in-place task table with status icons, elapsed time, worker progress (last tool call shown for local workers). Falls back to plain text when piped.
+- Rich Panel run summary (green/yellow/red border by outcome).
+- Cloud auth 401 → actionable error: "Re-run ./setup to refresh credentials."
+- `use_admin_merge = true` in legion.toml: fully autonomous merge, no needs_human on owned repos.
+- Better PR descriptions: task title as heading, spec excerpt, files touched, styled footer.
+
+**Dogfood results:**
+- Dogfood #5: zero manual state edits, correct implementation, CI green.
+- Dogfood #6: 4-task stats module (mean/median/stdev/exports), dep-ordered, all 4 PRs auto-merged via admin, zero intervention. Elapsed: ~6 minutes wall-clock.
+- CI re-dispatch validated end-to-end: wrong hypotenuse impl → CI fail → reconcile → re-dispatch → correct impl → CI green.
+
+### Known gaps (not blocking for alpha)
+- Cloud session tokens expire; `./setup` required to refresh. Error message now actionable.
+- `legion cost` returns $0 in session mode (Modal billing API not yet wired).
+- Reviewer gate (enabled=false by default) works structurally but untested on `critical` verdicts in production.
+
+---
+
 ## 🏷️ v0.2.0 — session handoff (2026-04-24)
 
 Overnight session: 4 parallel agents + dogfood #4 on `ajsai47/legion-dogfood`.

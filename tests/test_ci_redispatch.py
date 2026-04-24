@@ -84,18 +84,18 @@ def _write_state(path: Path, run: RunState) -> None:
 # ---------------------------------------------------------------------------
 
 FAILING_CHECKS = [
-    {"name": "lint", "state": "completed", "conclusion": "failure"},
-    {"name": "build", "state": "completed", "conclusion": "success"},
+    {"name": "lint", "bucket": "fail", "state": "FAILURE"},
+    {"name": "build", "bucket": "pass", "state": "SUCCESS"},
 ]
 
 PASSING_CHECKS = [
-    {"name": "lint", "state": "completed", "conclusion": "success"},
-    {"name": "build", "state": "completed", "conclusion": "success"},
+    {"name": "lint", "bucket": "pass", "state": "SUCCESS"},
+    {"name": "build", "bucket": "pass", "state": "SUCCESS"},
 ]
 
 PENDING_CHECKS = [
-    {"name": "lint", "state": "in_progress", "conclusion": None},
-    {"name": "build", "state": "completed", "conclusion": "success"},
+    {"name": "lint", "bucket": "pending", "state": "IN_PROGRESS"},
+    {"name": "build", "bucket": "pass", "state": "SUCCESS"},
 ]
 
 NO_CHECKS: list[dict] = []
@@ -151,8 +151,8 @@ def test_check_ci_returns_none_on_non_json_output():
 
 
 def test_check_ci_pending_when_conclusion_is_null():
-    """check_ci() should treat conclusion=None (queued/in_progress) as pending."""
-    checks = [{"name": "ci", "state": "queued", "conclusion": None}]
+    """check_ci() should treat queued/in_progress state as pending."""
+    checks = [{"name": "ci", "bucket": "pending", "state": "QUEUED"}]
     fake_run = _mock_run([(0, _checks_json(checks), "")])
     with patch("lib.reconciler.subprocess.run", fake_run):
         result = reconciler.check_ci("https://github.com/x/y/pull/42")
@@ -164,11 +164,11 @@ def test_check_ci_pending_when_conclusion_is_null():
 # ---------------------------------------------------------------------------
 
 FAILING_CHECK_LIST = [
-    {"name": "lint", "state": "completed", "conclusion": "failure",
+    {"name": "lint", "bucket": "fail", "state": "FAILURE",
      "link": "https://github.com/x/y/actions/runs/1/jobs/10"},
-    {"name": "typecheck", "state": "completed", "conclusion": "failure",
+    {"name": "typecheck", "bucket": "fail", "state": "FAILURE",
      "link": "https://github.com/x/y/actions/runs/1/jobs/11"},
-    {"name": "build", "state": "completed", "conclusion": "success",
+    {"name": "build", "bucket": "pass", "state": "SUCCESS",
      "link": "https://github.com/x/y/actions/runs/1/jobs/12"},
 ]
 
@@ -213,7 +213,7 @@ def test_fetch_ci_failure_returns_placeholder_when_gh_fails():
 def test_fetch_ci_failure_when_no_failing_checks_at_fetch_time():
     """fetch_ci_failure() should handle the case where all checks are passing
     at the time it is called (race between check_ci and fetch)."""
-    passing = [{"name": "lint", "state": "completed", "conclusion": "success", "link": ""}]
+    passing = [{"name": "lint", "bucket": "pass", "state": "SUCCESS", "link": ""}]
     fake_run = _mock_run([(0, json.dumps(passing), "")])
     with patch("lib.reconciler.subprocess.run", fake_run):
         detail = reconciler.fetch_ci_failure("https://github.com/x/y/pull/42")

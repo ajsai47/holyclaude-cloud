@@ -30,6 +30,7 @@ class BudgetConfig:
 class ReconcilerConfig:
     mediator_max_retries: int = 2
     branch_prefix: str = "legion/"
+    use_admin_merge: bool = False
 
 
 @dataclass

@@ -93,6 +93,12 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str
     # Prune dangling worktree registrations (e.g. after `rm -rf .legion`).
     subprocess.run(["git", "worktree", "prune"], check=False, capture_output=True)
 
+    # Clear stale blocker from any previous attempt so poll doesn't
+    # report failed before this new worker even runs.
+    blocker_path = Path(".legion/blockers") / f"{task.id}.md"
+    if blocker_path.exists():
+        blocker_path.unlink()
+
     if not worktree.exists():
         create = subprocess.run(
             ["git", "worktree", "add", "-B", branch_name, str(worktree), base_branch],
@@ -176,6 +182,98 @@ def _claude_stream_finished(log_path: Path) -> bool:
     return '"type":"result"' in tail
 
 
+def get_worker_last_action(task: Task) -> str:
+    """Extract a short human-readable description of the last thing the worker did.
+    Returns empty string if nothing meaningful found."""
+    log_path = Path(f".legion/local_logs/{task.id}.log")
+    if not log_path.exists() or task.target != "local":
+        return ""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    last_action = ""
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        # Tool uses: extract tool name + key input
+        if evt.get("type") == "assistant":
+            msg = evt.get("message", {})
+            for block in msg.get("content", []):
+                if block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    inp = block.get("input", {})
+                    # Pick the most informative input field
+                    detail = (inp.get("file_path") or inp.get("path") or
+                              inp.get("command", "")[:40] or inp.get("pattern", "")[:40] or "")
+                    if detail:
+                        last_action = f"{name}: {Path(detail).name if '/' in detail else detail}"
+                    else:
+                        last_action = name
+    return last_action[:45]  # cap length
+
+
+def _make_pr_body(task: Task, target: str = "local") -> str:
+    """Return a well-formatted PR body for the given task.
+
+    Format:
+      ## {task.title}
+
+      <first 3 sentences of task.spec>
+
+      **Files touched:** `a.py`, `b.py`   (only if task.files_touched is set)
+
+      ---
+      *Spawned by [HolyClaude Legion](...) · {target} worker · task {task.id}*
+      <!-- legion-task-id: {task.id} -->
+    """
+    import re as _re
+
+    # Extract first 3 sentences from spec. Split on sentence-ending punctuation
+    # followed by whitespace/newline, OR on bare newlines. Take the first 3
+    # non-empty segments and rejoin as a single paragraph.
+    raw = (task.spec or "").strip()
+    # Split on ". " / ".\n" / "\n\n" / "\n" — keep delimiters attached so we
+    # don't lose trailing periods when rejoining.
+    segments = _re.split(r'(?<=\.)\s+|\n+', raw)
+    segments = [s.strip() for s in segments if s.strip()]
+    summary = " ".join(segments[:3])
+
+    lines: list[str] = [
+        f"## {task.title}",
+        "",
+        summary,
+    ]
+
+    files_touched = getattr(task, "files_touched", None)
+    if files_touched:
+        if isinstance(files_touched, (list, tuple)):
+            files_str = ", ".join(f"`{f}`" for f in files_touched)
+        else:
+            files_str = str(files_touched)
+        lines += ["", f"**Files touched:** {files_str}"]
+
+    lines += [
+        "",
+        "---",
+        f"*Spawned by [HolyClaude Legion](https://github.com/ajsai47/holyclaude-cloud)"
+        f" · {target} worker · task {task.id}*",
+        f"<!-- legion-task-id: {task.id} -->",
+    ]
+
+    return "\n".join(lines)
+
+
 def poll_local(task: Task, base_branch: str) -> dict | None:
     """Check if the local worker has finished. None if still running.
 
@@ -224,6 +322,26 @@ def poll_local(task: Task, base_branch: str) -> dict | None:
     def _run(argv, **kw):
         return subprocess.run(argv, cwd=worktree, capture_output=True, text=True, **kw)
 
+    # Check for auth failure before any other status logic.
+    local_log_text = ""
+    if log_path.exists():
+        try:
+            local_log_text = log_path.read_text(errors="replace")
+        except Exception:
+            pass
+    if (
+        "authentication_failed" in local_log_text
+        or '"api_error_status":401' in local_log_text
+        or "Invalid authentication credentials" in local_log_text
+    ):
+        return {
+            "status": "claude_failed",
+            "error": (
+                "Authentication failed (401). Your session token has expired. "
+                "Re-run ./setup to refresh credentials, then retry."
+            ),
+        }
+
     # Blocker marker?
     blocker_path = Path(f".legion/blockers/{task.id}.md")
     if blocker_path.exists():
@@ -247,6 +365,11 @@ def poll_local(task: Task, base_branch: str) -> dict | None:
 
     # Commit anything uncommitted
     if has_uncommitted:
+        gitignore = worktree / ".gitignore"
+        content = gitignore.read_text() if gitignore.exists() else ""
+        if ".supercoder/" not in content:
+            with open(gitignore, "a") as f:
+                f.write("\n.supercoder/\n")
         add = _run(["git", "add", "-A"])
         if add.returncode != 0:
             return {"status": "failed", "error": f"git add: {add.stderr}"}
@@ -260,10 +383,7 @@ def poll_local(task: Task, base_branch: str) -> dict | None:
         return {"status": "failed", "error": f"git push: {push.stderr}"}
 
     # Open PR (against the actual base branch)
-    pr_body = (
-        f"{task.spec}\n\n---\n<!-- legion-task-id: {task.id} -->\n"
-        f"Spawned by HolyClaude Legion (local worker).\n"
-    )
+    pr_body = _make_pr_body(task, target="local")
     pr_result = _run([
         "gh", "pr", "create",
         "--base", base_branch,
@@ -337,6 +457,7 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str,
         "--base-branch", base_branch,
         "--branch-prefix", branch_prefix,
         "--auth-mode", auth_mode,
+        "--pr-body", _make_pr_body(task, target="cloud"),
     ]
     proc = subprocess.Popen(
         cmd,
@@ -396,9 +517,29 @@ def poll_cloud(task: Task) -> dict | None:
         }
 
     try:
-        return json.loads(result_path.read_text())
+        result = json.loads(result_path.read_text())
     except Exception as e:
         return {"status": "failed", "error": f"bad result json: {e}"}
+
+    # Enrich claude_failed results with actionable auth error message.
+    if result.get("status") == "claude_failed":
+        log_path = CLOUD_LOG_ROOT / f"{task.id}.log"
+        log_text = ""
+        if log_path.exists():
+            try:
+                log_text = log_path.read_text(errors="replace")
+            except Exception:
+                pass
+        if (
+            "authentication_failed" in log_text
+            or '"api_error_status":401' in log_text
+            or "Invalid authentication credentials" in log_text
+        ):
+            result["error"] = (
+                "Authentication failed (401). Your cloud session token has expired. "
+                "Re-run ./setup to push fresh credentials to Modal, then retry."
+            )
+    return result
 
 
 def kill_cloud(task: Task, signal_num: int = 15) -> bool:

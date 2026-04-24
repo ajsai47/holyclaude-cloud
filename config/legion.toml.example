@@ -36,6 +36,10 @@ worker_timeout_minutes = 30
 # escalating to the human.
 mediator_max_retries = 2
 
+# Set true if you own the repo and want to bypass branch protection for autonomous merges.
+# Requires admin rights on the repo. Equivalent to `gh pr merge --admin`.
+# use_admin_merge = false
+
 # github_repo is auto-detected from `git remote get-url origin` — no need to set this.
 # Override only if your remote URL doesn't point to the right repo.
 # github_repo = "owner/repo"

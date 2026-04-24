@@ -349,6 +349,17 @@ def _run_task_body(
         return d
 
     if rc != 0:
+        transcript_text = "".join(transcript)
+        auth_failure = (
+            "authentication_failed" in transcript_text
+            or '"api_error_status":401' in transcript_text
+            or "Invalid authentication credentials" in transcript_text
+        )
+        if auth_failure:
+            step(
+                "FATAL: Claude session auth expired (401). "
+                "Re-run ./setup on the host to push fresh credentials to Modal, then retry."
+            )
         return _emit_result({
             "task_id": task_id,
             "status": "claude_failed",
@@ -371,6 +382,12 @@ def _run_task_body(
             "status": "no_changes",
             "elapsed_s": time.perf_counter() - t_start,
         })
+
+    gitignore = Path(WORKSPACE) / ".gitignore"
+    gi_content = gitignore.read_text() if gitignore.exists() else ""
+    if ".supercoder/" not in gi_content:
+        with open(gitignore, "a") as f:
+            f.write("\n.supercoder/\n")
 
     subprocess.run(["git", "add", "-A"], cwd=WORKSPACE, check=True)
 
@@ -415,9 +432,15 @@ def _run_task_body(
             pass
 
     if not pr_url:
-        # Open PR. Body includes task body + a marker the reconciler reads.
-        pr_full_body = (
-            f"{pr_body or prompt}\n\n"
+        # Open PR. Use the pre-formatted body from the orchestrator (pr_body),
+        # which was built by _make_pr_body in dispatch.py and already contains
+        # the heading, summary, files-touched line, and the reconciler marker.
+        # Append the hook-note and container info after the marker line.
+        pr_full_body = pr_body + (
+            f"\n\n> Worker container: `{os.environ.get('MODAL_TASK_ID', 'unknown')}`."
+            f"{pr_full_body_hook_note}"
+        ) if pr_body else (
+            f"{prompt}\n\n"
             f"---\n"
             f"<!-- legion-task-id: {task_id} -->\n"
             f"Spawned by HolyClaude Legion. Worker container: `{os.environ.get('MODAL_TASK_ID', 'unknown')}`.\n"

@@ -19,10 +19,10 @@ Everything else is `legion run` in a tight loop, driven by Python.
 ```bash
 git status --porcelain              # must be empty
 test -f ./legion.toml || cp ~/holyclaude-cloud/config/legion.toml.example ./legion.toml
-/Users/ajsai47/tinker-env/bin/modal secret list | grep -q claude-pro-session
+legion doctor   # checks Claude CLI, gh auth, Modal CLI, secrets, legion.toml, git repo
 ```
 
-Any failure → stop and tell the user how to fix (usually: commit/stash, copy legion.toml, or run `~/holyclaude-cloud/setup`).
+If `legion doctor` exits non-zero → stop and show the output to the user. Any other failure → stop and tell the user how to fix (usually: commit/stash, copy legion.toml, or run `~/holyclaude-cloud/setup`).
 
 ---
 
@@ -36,7 +36,7 @@ If it exists:
 - `--resume` flag: skip to Step 5 (run loop).
 - No flag: AskUserQuestion: "Existing run detected. [resume / wipe and start fresh / cancel]"
 
-If it doesn't: fresh decomposition flow.
+If it doesn't: fresh decomposition flow. If starting fresh without a pre-written tasks.json, you can run `legion decompose "<goal>"` to generate `.legion/tasks.json` from plain English via Claude — no need to write JSON manually. Skip to Step 3a after it completes.
 
 ---
 
@@ -125,10 +125,14 @@ Hand off to the autonomous loop:
 ~/holyclaude-cloud/bin/legion run --tick-seconds 10
 ```
 
-This is foreground — stdout streams live. It prints:
-- `[run] spawned T-XXX → local|cloud` when a task dispatches
-- `[tick N] in_flight=X ready=Y shipped=Z merged=W` every tick with change
-- `LEGION RUN COMPLETE` + summary at end
+This is foreground — stdout streams live. On a TTY it renders a Rich live dashboard; when piped it falls back to plain text. Narrated events you'll see:
+- `⚡ T-001  <title>  →  local|cloud` on spawn
+- `✓ T-001  PR opened: <url>` when a PR ships
+- `✅ T-001  merged` on successful merge
+- `↩ T-001  re-dispatched (CI failed)` on re-dispatch
+- `⚠ T-001  <blocker>` on a blocking state
+
+A live in-place task table (status icon, elapsed time, last tool call for local workers) updates each tick. A Rich Panel summary with a green/yellow/red border prints at the end.
 
 Let it run. **Don't try to drive the loop yourself** — it handles everything the CLI handles: spawn, poll, reconcile, mediate, re-dispatch on CI fail, ramp, throttle backoff, graceful stop.
 
@@ -161,6 +165,8 @@ Read the final summary. Surface to the user:
 ## Subcommand reference
 
 ```
+legion doctor                                    # pre-flight health check
+legion decompose "<goal>"                        # generate tasks.json from plain-English goal
 legion critique <tasks.json> [--goal G]          # critic only, no changes
 legion decompose-refine <tasks.json> [--goal G]  # critic + refiner loop
                                                  # up to --iterations (default 3),

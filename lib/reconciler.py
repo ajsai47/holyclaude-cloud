@@ -94,7 +94,7 @@ def check_ci(pr_url: str | None) -> str:
     if not num:
         return "none"
     result = subprocess.run(
-        ["gh", "pr", "checks", num, "--json", "state,conclusion,name", *_gh_repo(pr_url)],
+        ["gh", "pr", "checks", num, "--json", "state,bucket,name", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     # If no checks: gh exits 0 with `[]`, or exits 8 ("no checks")
@@ -104,12 +104,18 @@ def check_ci(pr_url: str | None) -> str:
         checks = []
     if not checks:
         return "none"
-    has_fail = any(c.get("conclusion") == "failure" for c in checks)
+    # `bucket` values: "pass", "fail", "pending", "skipping"
+    # `state` values: "SUCCESS", "FAILURE", "ERROR", "PENDING", "IN_PROGRESS", etc.
+    has_fail = any(
+        c.get("bucket") == "fail"
+        or c.get("state", "").upper() in ("FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED")
+        for c in checks
+    )
     if has_fail:
         return "fail"
     has_pending = any(
-        c.get("state") in ("pending", "queued", "in_progress")
-        or c.get("conclusion") is None
+        c.get("bucket") == "pending"
+        or c.get("state", "").upper() in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
         for c in checks
     )
     if has_pending:
@@ -139,7 +145,7 @@ def fetch_ci_failure(pr_url: str | None) -> str:
     if not num:
         return "(no pr to fetch)"
     result = subprocess.run(
-        ["gh", "pr", "checks", num, "--json", "name,state,conclusion,link", *_gh_repo(pr_url)],
+        ["gh", "pr", "checks", num, "--json", "name,state,bucket,link", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -148,7 +154,11 @@ def fetch_ci_failure(pr_url: str | None) -> str:
         checks = json.loads(result.stdout)
     except Exception:
         return "(could not parse gh pr checks output)"
-    failing = [c for c in checks if c.get("conclusion") == "failure"]
+    failing = [
+        c for c in checks
+        if c.get("bucket") == "fail"
+        or c.get("state", "").upper() in ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED")
+    ]
     if not failing:
         return "(no failing checks detected at fetch time)"
 
@@ -177,7 +187,7 @@ def _get_merge_state(num: str, pr_url: str | None = None) -> str:
     return "UNKNOWN"
 
 
-def merge_pr(task: Task) -> dict:
+def merge_pr(task: Task, use_admin_merge: bool = False) -> dict:
     """Attempt to merge task's PR. Returns a result dict."""
     num = pr_number(task.pr_url)
     if not num:
@@ -190,7 +200,8 @@ def merge_pr(task: Task) -> dict:
         return {"status": "merged", "note": "already merged on github"}
 
     result = subprocess.run(
-        ["gh", "pr", "merge", num, "--squash", "--delete-branch", *repo_args],
+        ["gh", "pr", "merge", num, "--squash", "--delete-branch",
+         *repo_args, *(["--admin"] if use_admin_merge else [])],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
