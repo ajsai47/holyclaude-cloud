@@ -2,6 +2,72 @@
 
 ---
 
+## 🏷️ v0.2.0 — session handoff (2026-04-24)
+
+Overnight session: 4 parallel agents + dogfood #4 on `ajsai47/legion-dogfood`.
+
+### What shipped in v0.2.0
+
+- **Packaging:** `pyproject.toml` with deps + entry point, `requirements.txt`, `pip install -e .` works, `legion` CLI available via entry point, modal path priority fixed in setup
+- **Secret hygiene:** all `modal secret create` calls now use `--from-dotenv` + chmod-600 tmpfile; secrets never appear as CLI args or shell history
+- **Worker hardening:** pre-commit hook detection → `--no-verify` + PR body note (#8 closed); `.mcp.json` renamed before `claude -p` + restored after (#11 closed)
+- **CI re-dispatch tests:** 23 unit tests covering `check_ci()`, `fetch_ci_failure()`, re-queue state transition, retry cap
+- **Setup UX:** missing GH token = hard exit; modal auth shows `modal token new`; final `[ok]/[-]` checklist
+- **69 tests passing** (up from 46)
+
+### Dogfood #4 — legion-dogfood cross-repo (2026-04-24)
+
+Target: `ajsai47/legion-dogfood` (Python, branch protection + CODEOWNERS + CI guard required).
+2-task DAG: T-001 `div()` + T-002 `mod()` (independent, both touch same test file).
+
+**Outcome:** Both PRs merged. CI passing on both. Tasks were substantively correct.
+
+**Findings (priority-ordered for next session):**
+
+1. **NEW — Claude ignores "don't open PRs yourself" constraint.** T-001's worker
+   instructed Claude not to open a PR; Claude opened one anyway with a different
+   title. The worker's subsequent `gh pr create` hit "already exists" → returned
+   `pushed_no_pr`, `pr_url: null`. State went out of sync with GitHub.
+   Fix: worker should check `gh pr list --head <branch>` before `gh pr create`,
+   and if a PR already exists adopt its URL rather than failing.
+
+2. **NEW — Reconciler and reviewer require git-repo working directory.**
+   Running `legion run` from a non-git directory (`/tmp/dogfood-run`) breaks
+   `gh pr diff`, `gh pr merge`, and the local reviewer — all rely on git context.
+   The intended pattern (run from inside the target repo) works; the non-repo
+   pattern silently degrades. Fix: detect and error early, or allow passing
+   `--repo-url` to reconciler so it can operate repo-agnostically.
+
+3. **Branch protection + CODEOWNERS → needs_human path validated.** Reconciler
+   correctly surfaces BLOCKED state. Can't auto-approve own PRs (GitHub security
+   model). Manual admin merge with `gh pr merge --admin` works for dogfood.
+   For production: needs a bot account or bypass token for the merge step.
+
+4. **Mediator path exercised (manually).** T-001 and T-002 both edited
+   `tests/test_math_ops.py` and `src/target/__init__.py` → real conflict on
+   T-002 after T-001 merged. Resolved manually by rebase. Mediator code path
+   works but requires git-repo context (same as finding #2).
+
+5. **CI re-dispatch still not fired end-to-end.** All CI runs passed. The code
+   path is unit-tested (23 tests) but never triggered in production.
+
+6. **`local_file_threshold` routing trap.** Default threshold of 5 files routes
+   small tasks local; local workers require a git-repo working directory. If the
+   operator runs from a temp dir (as we did), every spawn fails silently.
+   Fix: either document clearly (run from inside target repo) or detect non-git
+   cwd and error before spawning.
+
+### Revised priority list for next session
+
+1. **Worker: adopt existing PR URL** (finding #1 — state sync bug, critical for reliability)
+2. **Reconciler: repo-agnostic operation** (finding #2 — blocks reconcile from non-repo dirs)
+3. **Operator docs / quickstart** — the "run from inside target repo" pattern is non-obvious; README needs a clear "where to run legion" section
+4. **CI re-dispatch live validation** — synthesize a task that fails CI to exercise the path
+5. **Bot account or bypass token for auto-merge** — branch protection wall requires this for fully autonomous operation
+6. **Wire 5C brain** — deferred per cadence rule; unblock after findings #1+#2 closed
+
+---
+
 ## 🏷️ v0.1.0 — session handoff (2026-04-19)
 
 Polished to a shareable tagged release. See [CHANGELOG.md](CHANGELOG.md) for the
