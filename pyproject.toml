@@ -16,6 +16,9 @@ dev = ["pytest"]
 [project.scripts]
 legion = "lib.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["lib*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
