@@ -84,7 +84,7 @@ The setup script:
 ```bash
 cd /path/to/your-target-repo        # ← must be inside the repo
 cp ~/holyclaude-cloud/config/legion.toml.example legion.toml
-# edit legion.toml — set github_repo = "owner/repo"
+# github_repo is auto-detected from git remote — no edits required for most repos
 ```
 
 Then in a Claude Code session inside that same repo:
