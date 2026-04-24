@@ -42,6 +42,14 @@ def cmd_init(args) -> int:
         print(f"error: {tasks_path} not found", file=sys.stderr)
         return 1
 
+    if not Path("legion.toml").exists():
+        print(
+            "warning: no legion.toml found in current directory.\n"
+            "  Copy one: cp ~/holyclaude-cloud/config/legion.toml.example legion.toml\n"
+            "  Without it, legion uses built-in defaults (may not match your repo).",
+            file=sys.stderr,
+        )
+
     raw = json.loads(tasks_path.read_text())
     if not isinstance(raw, list):
         print("error: tasks.json must be a JSON list of task objects", file=sys.stderr)
@@ -353,12 +361,18 @@ def cmd_cost(_args) -> int:
             end = t.finished_at or time.time()
             cloud_minutes += (end - t.dispatched_at) / 60.0
 
+    worker_count = sum(
+        1 for t in s.tasks.values()
+        if t.target == "cloud" and t.finished_at is not None
+    )
+
     summary = {
-        "auth_mode": "pro_session",     # hardcoded for Phase 2
+        "auth_mode": cfg.swarm.auth_mode,
         "dollars_so_far": 0.0,          # Pro session is free
         "cloud_worker_minutes": round(cloud_minutes, 1),
+        "worker_count": worker_count,
         "cap_dollars_per_hour": cfg.budget.max_dollars_per_hour,
-        "note": "Phase 4 will integrate real Modal billing API; for now Pro session = $0.",
+        "note": "Pro session workers are free (Modal compute not billed). API-mode workers billed at Modal's per-second rate. Modal billing API integration is planned.",
     }
     print(json.dumps(summary, indent=2))
     return 0
@@ -888,13 +902,24 @@ def render_run_summary(s: "state.RunState", say) -> int:
         if t.pr_url:
             say(f"    \u2713 {t.id}: {t.pr_url}")
     for t in blocked:
-        reason = t.merge_blocker or "blocked"
-        say(f"    \u26a0 {t.id}: {reason[:120]}")
+        if t.merge_blocker == "needs_human":
+            say(f"  \u26a0 {t.id}: needs_human \u2014 approve and merge manually:")
+            if t.pr_url:
+                say(f"      {t.pr_url}")
+        else:
+            reason = t.merge_blocker or "blocked"
+            say(f"    \u26a0 {t.id}: {reason[:120]}")
     for t in failed:
         reason = t.error or t.status or "unknown"
         say(f"    \u2717 {t.id}: {reason[:120]}")
     for t in cancelled:
         say(f"    \u29d7 {t.id}: cancelled")
+
+    if any(t.merge_blocker == "needs_human" for t in blocked):
+        nh_count = sum(1 for t in blocked if t.merge_blocker == "needs_human")
+        say("")
+        say(f"  Action required: {nh_count} PR(s) need manual approval before legion can continue.")
+        say("  Run `legion run --resume` after merging to drain any remaining queue.")
 
     # Non-zero exit when any task ended in a non-success terminal state
     # that indicates human attention is needed.
@@ -1047,7 +1072,21 @@ def cmd_run(args) -> int:
         merged = sum(1 for t in s2.tasks.values() if t.merged_at is not None)
         inf = len(state.in_flight_tasks(s2))
         rdy = len(state.ready_tasks(s2))
-        status = f"[tick {tick}] in_flight={inf} ready={rdy} shipped={shipped} merged={merged}"
+        # Build compact task-ID suffix for tasks that have been touched (not pending)
+        touched = [
+            t for t in s2.tasks.values() if t.status != "pending"
+        ]
+        suffix_parts = [f"{t.id}:{t.status}" for t in touched]
+        suffix_raw = " ".join(suffix_parts)
+        if suffix_raw:
+            suffix_candidate = f"  [{suffix_raw}]"
+            if len(suffix_candidate) > 80:
+                # Truncate to 79 chars and add ellipsis
+                suffix_candidate = suffix_candidate[:79] + "\u2026"
+            suffix = suffix_candidate
+        else:
+            suffix = ""
+        status = f"[tick {tick}] in_flight={inf} ready={rdy} shipped={shipped} merged={merged}{suffix}"
         if status != last_status:
             _say(status)
             last_status = status
@@ -1177,8 +1216,8 @@ def main(argv: list[str] | None = None) -> int:
     p_scale.set_defaults(func=cmd_scale)
 
     p_run = sub.add_parser("run", help="Autonomous dispatch + reconcile loop")
-    p_run.add_argument("--tick-seconds", type=int, default=10,
-                       help="Seconds between ticks (default 10)")
+    p_run.add_argument("--tick-seconds", type=int, default=8,
+                       help="Seconds between ticks (default 8)")
     p_run.add_argument("--max-ticks", type=int, default=0,
                        help="Max ticks before exit (default 0 = unlimited)")
     p_run.add_argument("--quiet", action="store_true")
