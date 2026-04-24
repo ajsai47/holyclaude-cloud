@@ -14,6 +14,31 @@ _summary_configured=()
 _summary_skipped=()
 
 # ---------------------------------------------------------------------
+# 0. Python version check
+# ---------------------------------------------------------------------
+_py=$(command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || true)
+if [[ -z "$_py" ]]; then
+    echo "setup: Python 3.11+ is required but no python3 was found in PATH." >&2
+    echo "  Install: brew install python@3.11" >&2
+    exit 1
+fi
+_pyver=$("$_py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+_pymaj="${_pyver%%.*}"
+_pymin="${_pyver#*.}"
+if [[ "$_pymaj" -lt 3 ]] || [[ "$_pymaj" -eq 3 && "$_pymin" -lt 11 ]]; then
+    echo "setup: Python 3.11+ required; found $_pyver (via $_py)." >&2
+    echo "  Install: brew install python@3.11   then re-run: python3.11 -m pip install -e ." >&2
+    exit 1
+fi
+if [[ "$_pymaj" -eq 3 && "$_pymin" -ge 14 ]]; then
+    echo "setup: WARNING — Python $_pyver detected. Python 3.14 has a known broken" >&2
+    echo "  expat binding on macOS (Symbol not found: _XML_SetAllocTrackerActivationThreshold)." >&2
+    echo "  Use Python 3.11–3.13: brew install python@3.11 && python3.11 -m pip install -e ." >&2
+    exit 1
+fi
+echo "setup: Python $_pyver OK (via $_py)"
+
+# ---------------------------------------------------------------------
 # 1. Locate Modal CLI
 # ---------------------------------------------------------------------
 MODAL_BIN_CANDIDATES=(

@@ -51,39 +51,41 @@ End-to-end validated on its own repo ("dogfood") plus a sandbox. Ships PRs that 
 
 ## Install
 
+**Python 3.11–3.13 required.** Python 3.14 has a known broken expat binding on macOS. Use pyenv or `brew install python@3.11` if your system Python is 3.14+.
+
 ```bash
 git clone https://github.com/ajsai47/holyclaude-cloud
 cd holyclaude-cloud
-pip install -e .
-./setup
+pip install -e .      # puts `legion` on PATH
+./setup               # pushes secrets to Modal, verifies auth
 ```
 
-`pip install -e .` puts `legion` on your PATH as a proper console script.  
-Re-run setup any time creds rotate.
+`setup` will check your Python version and exit with a clear message if it's wrong.  
+Re-run `./setup` any time creds rotate.
 
-**Reproducible local install** (pins matching the Modal worker image):
-
+**Reproducible install** (pins matching the Modal worker image):
 ```bash
 pip install -r requirements.txt
 ```
 
 The setup script:
 1. Finds your Modal CLI (looks on PATH first, then common venv locations)
-2. Verifies Modal auth
-3. Extracts Claude Pro session creds from macOS keychain (or `~/.claude/.credentials.json`) and pushes as the `claude-pro-session` Modal secret
-4. Reads `gh auth token` (or `$GITHUB_TOKEN`) and pushes as the `legion-github` Modal secret
-5. Pushes a placeholder `anthropic-api-key` secret (the `--api` escape hatch requires the real key; see below)
+2. Verifies Modal auth — if not authed, run `modal token new` (opens a browser)
+3. Extracts Claude Pro session creds from macOS keychain (or `~/.claude/.credentials.json`)
+4. Reads `gh auth token` (or `$GITHUB_TOKEN`) and pushes as `legion-github` secret — **required**, exits if missing
+5. Pushes a placeholder `anthropic-api-key` (the `--api` escape hatch needs the real key; see below)
 
 ## Quickstart
 
-In the repo you want to swarm against:
+> **Where to run legion:** Always run `legion` from **inside the target repo's directory** (the repo you want workers to edit). The reconciler and reviewer need git context to call `gh pr merge`. Running from an unrelated directory will break reconcile.
 
 ```bash
-cd /path/to/your/repo
-cp ~/holyclaude-cloud/config/legion.toml.example legion.toml  # gitignored
+cd /path/to/your-target-repo        # ← must be inside the repo
+cp ~/holyclaude-cloud/config/legion.toml.example legion.toml
+# edit legion.toml — set github_repo = "owner/repo"
 ```
 
-Then in a Claude Code session:
+Then in a Claude Code session inside that same repo:
 
 ```
 /legion-start "Add JWT auth to /api/user with tests and a README section"

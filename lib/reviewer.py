@@ -41,9 +41,10 @@ def fetch_pr_diff(pr_url: str | None) -> str:
     """Return the full diff of the PR as a string. Empty string on error."""
     if not pr_url:
         return ""
+    from .reconciler import _gh_repo
     num = pr_url.rstrip("/").split("/")[-1]
     result = subprocess.run(
-        ["gh", "pr", "diff", num],
+        ["gh", "pr", "diff", num, *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -310,9 +311,10 @@ def post_pr_comment(pr_url: str, body: str) -> bool:
     """Post a comment on the PR via gh CLI. Returns True on success."""
     if not pr_url:
         return False
+    from .reconciler import _gh_repo
     num = pr_url.rstrip("/").split("/")[-1]
     result = subprocess.run(
-        ["gh", "pr", "comment", num, "--body", body],
+        ["gh", "pr", "comment", num, "--body", body, *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     return result.returncode == 0

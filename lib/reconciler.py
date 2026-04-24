@@ -68,6 +68,22 @@ def pr_number(pr_url: str | None) -> str | None:
     return pr_url.rstrip("/").split("/")[-1]
 
 
+def _gh_repo(pr_url: str | None) -> list[str]:
+    """Return ['--repo', 'owner/repo'] args for gh, extracted from the PR URL.
+    Returns [] if the URL can't be parsed — gh will fall back to git-context
+    inference (which may fail outside a repo, but at least we tried).
+    """
+    if not pr_url:
+        return []
+    parts = pr_url.rstrip("/").split("/")
+    try:
+        pull_idx = parts.index("pull")
+        repo = f"{parts[pull_idx - 2]}/{parts[pull_idx - 1]}"
+        return ["--repo", repo]
+    except (ValueError, IndexError):
+        return []
+
+
 def check_ci(pr_url: str | None) -> str:
     """Returns one of: 'pass', 'fail', 'pending', 'none'.
 
@@ -78,7 +94,7 @@ def check_ci(pr_url: str | None) -> str:
     if not num:
         return "none"
     result = subprocess.run(
-        ["gh", "pr", "checks", num, "--json", "state,conclusion,name"],
+        ["gh", "pr", "checks", num, "--json", "state,conclusion,name", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     # If no checks: gh exits 0 with `[]`, or exits 8 ("no checks")
@@ -101,10 +117,10 @@ def check_ci(pr_url: str | None) -> str:
     return "pass"
 
 
-def _pr_is_merged(pr_num: str) -> bool:
+def _pr_is_merged(pr_num: str, pr_url: str | None = None) -> bool:
     """Query github for the actual merge state — independent of gh exit code."""
     result = subprocess.run(
-        ["gh", "pr", "view", pr_num, "--json", "state"],
+        ["gh", "pr", "view", pr_num, "--json", "state", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -123,7 +139,7 @@ def fetch_ci_failure(pr_url: str | None) -> str:
     if not num:
         return "(no pr to fetch)"
     result = subprocess.run(
-        ["gh", "pr", "checks", num, "--json", "name,state,conclusion,link"],
+        ["gh", "pr", "checks", num, "--json", "name,state,conclusion,link", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -146,11 +162,11 @@ def fetch_ci_failure(pr_url: str | None) -> str:
     return "\n".join(lines)
 
 
-def _get_merge_state(num: str) -> str:
+def _get_merge_state(num: str, pr_url: str | None = None) -> str:
     """Synchronous query of GitHub's mergeStateStatus.
     Returns UNKNOWN on any failure."""
     result = subprocess.run(
-        ["gh", "pr", "view", num, "--json", "mergeStateStatus"],
+        ["gh", "pr", "view", num, "--json", "mergeStateStatus", *_gh_repo(pr_url)],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
@@ -166,14 +182,15 @@ def merge_pr(task: Task) -> dict:
     num = pr_number(task.pr_url)
     if not num:
         return {"status": "failed", "error": "no pr_url"}
+    repo_args = _gh_repo(task.pr_url)
 
     # Stale-state recovery: if the PR is already merged (e.g. a prior
     # reconcile call failed to record merged_at), short-circuit.
-    if _pr_is_merged(num):
+    if _pr_is_merged(num, task.pr_url):
         return {"status": "merged", "note": "already merged on github"}
 
     result = subprocess.run(
-        ["gh", "pr", "merge", num, "--squash", "--delete-branch"],
+        ["gh", "pr", "merge", num, "--squash", "--delete-branch", *repo_args],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
@@ -184,14 +201,14 @@ def merge_pr(task: Task) -> dict:
     # Benign case: GitHub side merged but gh failed to delete the local
     # branch (usually because a worktree still has it checked out). Verify.
     if "failed to delete" in err or "failed to delete local branch" in err:
-        if _pr_is_merged(num):
+        if _pr_is_merged(num, task.pr_url):
             return {"status": "merged", "note": "local branch delete skipped"}
 
     # Disambiguate failure modes via GitHub's mergeStateStatus. `gh pr merge`
     # prints "not mergeable" for BOTH real merge conflicts (DIRTY) and
     # branch-protection blocks (BLOCKED) — string-matching alone wrongly
     # invoked the mediator on branch-protected repos.
-    merge_state = _get_merge_state(num)
+    merge_state = _get_merge_state(num, task.pr_url)
     if merge_state == "BLOCKED":
         return {
             "status": "needs_human",
@@ -222,7 +239,7 @@ def merge_pr(task: Task) -> dict:
 
     # Final fallback: check actual state — if the merge went through despite
     # gh returning non-zero for some other reason, report merged.
-    if _pr_is_merged(num):
+    if _pr_is_merged(num, task.pr_url):
         return {"status": "merged", "note": "gh returned non-zero but PR is merged"}
 
     return {"status": "gh_error", "error": result.stderr or result.stdout}
@@ -239,7 +256,8 @@ def wait_for_mergeable(pr_url: str, timeout_s: int = 30, poll_s: int = 3) -> str
     last = "UNKNOWN"
     while _time.time() < deadline:
         result = subprocess.run(
-            ["gh", "pr", "view", num, "--json", "mergeStateStatus,mergeable,state"],
+            ["gh", "pr", "view", num, "--json", "mergeStateStatus,mergeable,state",
+             *_gh_repo(pr_url)],
             capture_output=True, text=True,
         )
         if result.returncode == 0:

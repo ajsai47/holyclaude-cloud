@@ -392,28 +392,52 @@ def _run_task_body(
     )
     step(f"pushed branch {branch_name}")
 
-    # Open PR. Body includes task body + a marker the reconciler reads.
-    pr_full_body = (
-        f"{pr_body or prompt}\n\n"
-        f"---\n"
-        f"<!-- legion-task-id: {task_id} -->\n"
-        f"Spawned by HolyClaude Legion. Worker container: `{os.environ.get('MODAL_TASK_ID', 'unknown')}`.\n"
-        f"{pr_full_body_hook_note}"
-    )
-    pr_create = subprocess.run(
-        ["gh", "pr", "create",
-         "--base", base_branch,
-         "--head", branch_name,
-         "--title", f"{task_id}: {title}",
-         "--body", pr_full_body],
-        cwd=WORKSPACE,
+    # Derive repo slug for gh --repo (e.g. "ajsai47/legion-dogfood")
+    repo_slug = _re.sub(r"^https://[^/]+/", "", repo_url).rstrip("/")
+    if repo_slug.endswith(".git"):
+        repo_slug = repo_slug[:-4]
+
+    # Check if Claude already opened a PR (it sometimes ignores the "don't PR
+    # yourself" constraint). Adopt that URL rather than failing with "already exists".
+    existing_check = subprocess.run(
+        ["gh", "pr", "list", "--head", branch_name, "--repo", repo_slug,
+         "--json", "url", "--state", "open"],
         capture_output=True, text=True,
     )
-    pr_url = pr_create.stdout.strip() if pr_create.returncode == 0 else None
-    if pr_url:
-        step(f"opened PR: {pr_url}")
-    else:
-        step(f"gh pr create failed: {pr_create.stderr}")
+    pr_url = None
+    if existing_check.returncode == 0:
+        try:
+            prs = json.loads(existing_check.stdout)
+            if prs:
+                pr_url = prs[0]["url"]
+                step(f"adopting PR already opened by Claude: {pr_url}")
+        except Exception:
+            pass
+
+    if not pr_url:
+        # Open PR. Body includes task body + a marker the reconciler reads.
+        pr_full_body = (
+            f"{pr_body or prompt}\n\n"
+            f"---\n"
+            f"<!-- legion-task-id: {task_id} -->\n"
+            f"Spawned by HolyClaude Legion. Worker container: `{os.environ.get('MODAL_TASK_ID', 'unknown')}`.\n"
+            f"{pr_full_body_hook_note}"
+        )
+        pr_create = subprocess.run(
+            ["gh", "pr", "create",
+             "--base", base_branch,
+             "--head", branch_name,
+             "--title", f"{task_id}: {title}",
+             "--body", pr_full_body,
+             "--repo", repo_slug],
+            cwd=WORKSPACE,
+            capture_output=True, text=True,
+        )
+        pr_url = pr_create.stdout.strip() if pr_create.returncode == 0 else None
+        if pr_url:
+            step(f"opened PR: {pr_url}")
+        else:
+            step(f"gh pr create failed: {pr_create.stderr}")
 
     shared_brain.commit()  # flush any claude-mem writes
 
