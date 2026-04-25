@@ -737,13 +737,19 @@ def cmd_reconcile(args) -> int:
                     (
                         "### Legion merge blocked — needs human review\n\n"
                         "This PR is ready to merge but the base branch is "
-                        "protected. Likely causes: required approvals from "
-                        "CODEOWNERS, or a required status check that hasn't "
-                        "passed.\n\n"
+                        "protected.\n\n"
+                        "**Likely causes:**\n"
+                        "- Required approvals from CODEOWNERS not satisfied\n"
+                        "- Required status check hasn't passed\n"
+                        "- Branch protection requires admin override\n\n"
                         f"GitHub mergeStateStatus: `{mr.get('merge_state', 'UNKNOWN')}`\n\n"
                         f"gh error: `{(mr.get('error') or '').strip()[:300]}`\n\n"
-                        "_Approve + merge manually, or resolve the blocker "
-                        "and the next reconcile pass will auto-heal._"
+                        "**To enable legion auto-merge on protected branches:**\n"
+                        "1. Set `use_admin_merge = true` in `legion.toml` `[reconciler]`\n"
+                        "2. Ensure your GitHub token has admin rights on this repo\n"
+                        "   (`./setup` will re-push it if you re-auth with admin scope)\n\n"
+                        "_Or: approve + merge this PR manually, then run "
+                        "`legion run --resume` to drain the remaining queue._"
                     ),
                 )
             results.append({
@@ -1830,6 +1836,38 @@ def cmd_doctor(_args) -> int:
             warn("session token", f"could not parse credentials: {_e}")
     else:
         warn("session token", "no local credentials found — run ./setup if using session auth")
+
+    # Pre-commit hooks detection
+    _hook_paths = [
+        Path(".pre-commit-config.yaml"), Path(".pre-commit-config.yml"),
+        Path(".husky"), Path("lefthook.yml"), Path("lefthook.yaml"),
+        Path(".lefthook.yml"), Path(".lefthook.yaml"),
+    ]
+    _found_hooks = [str(p) for p in _hook_paths if p.exists()]
+    if not _found_hooks:
+        _pkg = Path("package.json")
+        if _pkg.exists():
+            try:
+                _pkg_data = json.loads(_pkg.read_text())
+                _all_deps = {**_pkg_data.get("dependencies", {}), **_pkg_data.get("devDependencies", {})}
+                if "husky" in _all_deps:
+                    _found_hooks = ["package.json (husky)"]
+            except Exception:
+                pass
+    if _found_hooks:
+        warn(
+            "pre-commit hooks",
+            f"detected ({', '.join(_found_hooks)}) — workers may fail on git commit. "
+            "Set SKIP=all or configure bypass in your repo before running legion.",
+        )
+
+    # .mcp.json in target repo
+    if Path(".mcp.json").exists():
+        warn(
+            ".mcp.json",
+            "found in repo — cloud workers may emit MCP init warnings inside Modal. "
+            "Usually non-blocking, but verify your first cloud run.",
+        )
 
     # Summary
     total = passed + failed

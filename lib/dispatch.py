@@ -46,6 +46,8 @@ def find_modal_bin() -> str:
 WORKTREE_ROOT = Path(".legion/worktrees")
 LOCAL_LOG_ROOT = Path(".legion/local_logs")
 
+_cloud_first_dispatch_notified = False
+
 
 # ----------------------------------------------------------------------
 # Framing — same prompt structure for local + cloud
@@ -454,6 +456,15 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str,
 
     module_path = Path(__file__).parent.parent / "modal" / "worker.py"
     CLOUD_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    global _cloud_first_dispatch_notified
+    if not _cloud_first_dispatch_notified:
+        _cloud_first_dispatch_notified = True
+        print(
+            f"\n[cloud] First cloud worker dispatched → log: {CLOUD_LOG_ROOT / f'{task.id}.log'}\n"
+            "[cloud] If this is your first run, Modal will build the worker image (~10-15 min).\n"
+            "[cloud] Subsequent runs reuse the cached image and start in seconds.\n",
+            flush=True,
+        )
     log_path = CLOUD_LOG_ROOT / f"{task.id}.log"
     log_fh = open(log_path, "wb")
 
