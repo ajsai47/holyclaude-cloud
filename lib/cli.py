@@ -51,6 +51,18 @@ def cmd_init(args) -> int:
             file=sys.stderr,
         )
 
+    _git_ok = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if _git_ok.returncode != 0 or _git_ok.stdout.strip() != "true":
+        print(
+            "error: `legion init` must be run from inside your target git repository.\n"
+            "  cd into the repo you want to swarm against first.",
+            file=sys.stderr,
+        )
+        return 1
+
     raw = json.loads(tasks_path.read_text())
     if not isinstance(raw, list):
         print("error: tasks.json must be a JSON list of task objects", file=sys.stderr)
@@ -302,7 +314,7 @@ def cmd_status(_args) -> int:
     _print_group("Ready", state.ready_tasks(s))
     _print_group("Shipped", by_status.get("shipped", []))
     _print_group("No changes", by_status.get("no_changes", []))
-    _print_group("Failed", by_status.get("failed", []))
+    _print_group("Failed", by_status.get("failed", []) + by_status.get("claude_failed", []))
     _print_group("Pending", [t for t in s.tasks.values() if t.status == "pending" and t.deps])
 
     return 0
@@ -347,33 +359,94 @@ def cmd_scale(args) -> int:
 # cost
 # ----------------------------------------------------------------------
 
+def _parse_token_usage(log_path: Path) -> dict:
+    """Parse a stream-json worker log for the terminal result event's token usage."""
+    if not log_path.exists():
+        return {}
+    try:
+        with open(log_path, "rb") as _f:
+            _f.seek(0, 2)
+            _size = _f.tell()
+            _f.seek(max(0, _size - 8192))
+            tail = _f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                evt = json.loads(line)
+                if evt.get("type") == "result":
+                    usage = evt.get("usage", {})
+                    return {
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "cache_read": usage.get("cache_read_input_tokens", 0),
+                        "cache_write": usage.get("cache_creation_input_tokens", 0),
+                    }
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {}
+
+
 def cmd_cost(_args) -> int:
-    """Cost summary. Phase 2 stub — Modal billing API integration is Phase 4."""
+    """Cost summary — token counts from worker logs + Modal compute time."""
     s = state.read_state()
     cfg = load_config()
 
-    # Rough estimate: sum of in-flight time across cloud workers, assume $0
-    # for Pro session workers. When we add --api, this becomes real.
     cloud_minutes = 0.0
+    worker_count = 0
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    per_task = []
+
     for t in s.tasks.values():
-        if t.target != "cloud":
-            continue
         if t.dispatched_at:
             end = t.finished_at or time.time()
-            cloud_minutes += (end - t.dispatched_at) / 60.0
+            if t.target == "cloud":
+                cloud_minutes += (end - t.dispatched_at) / 60.0
+                worker_count += 1
 
-    worker_count = sum(
-        1 for t in s.tasks.values()
-        if t.target == "cloud" and t.finished_at is not None
-    )
+        log_path = Path(f".legion/local_logs/{t.id}.log")
+        usage = _parse_token_usage(log_path)
+        if usage:
+            total_input += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
+            total_cache_read += usage.get("cache_read", 0)
+            total_cache_write += usage.get("cache_write", 0)
+            per_task.append({
+                "task_id": t.id,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_read_tokens": usage.get("cache_read", 0),
+            })
+
+    # Approximate cost for API mode (Sonnet 4.5 pricing as reference).
+    # Pro session mode is billed to your subscription, not per-token.
+    input_cost = round(total_input * 3.00 / 1_000_000, 4)
+    output_cost = round(total_output * 15.00 / 1_000_000, 4)
+    approx_api_cost = round(input_cost + output_cost, 4)
 
     summary = {
         "auth_mode": cfg.swarm.auth_mode,
-        "dollars_so_far": 0.0,          # Pro session is free
+        "tokens": {
+            "total_input": total_input,
+            "total_output": total_output,
+            "total_cache_read": total_cache_read,
+            "total_cache_write": total_cache_write,
+        },
+        "approx_api_cost_usd": approx_api_cost,
         "cloud_worker_minutes": round(cloud_minutes, 1),
         "worker_count": worker_count,
-        "cap_dollars_per_hour": cfg.budget.max_dollars_per_hour,
-        "note": "Pro session workers are free (Modal compute not billed). API-mode workers billed at Modal's per-second rate. Modal billing API integration is planned.",
+        "per_task": per_task,
+        "note": (
+            "Token counts from local worker logs (cloud worker logs not yet parsed). "
+            "approx_api_cost_usd assumes Sonnet pricing and is informational only — "
+            "Pro session charges to your subscription, not per token."
+        ),
     }
     print(json.dumps(summary, indent=2))
     return 0
@@ -527,15 +600,16 @@ def cmd_reconcile(args) -> int:
             verdict = rv.get("verdict", "error")
 
             if verdict == "error":
-                # Reviewer itself failed — log and proceed to merge this tick.
-                # Don't block on reviewer flakiness; next tick will retry.
+                # Reviewer errored (timeout, parse failure, CLI flake) — skip this
+                # task this tick. Reconciler retries on the next pass rather than
+                # silently merging unreviewed code.
                 results.append({
                     "task_id": task.id,
                     "status": "review_errored",
                     "detail": rv.get("error", ""),
                     "log": rv.get("log", ""),
                 })
-                # Fall through to merge below
+                continue
 
             elif verdict == "critical":
                 # Block merge + potentially re-dispatch
@@ -1127,6 +1201,19 @@ def cmd_run(args) -> int:
     quiet = args.quiet
     max_ticks = args.max_ticks or 0  # 0 = unbounded
 
+    # Must run from inside the target git repo — workers use git worktrees from CWD.
+    _git_ok = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if _git_ok.returncode != 0 or _git_ok.stdout.strip() != "true":
+        print(
+            "error: `legion run` must be executed from inside your target git repository.\n"
+            "  cd into the repo you want to swarm against, then re-run `legion run`.",
+            file=sys.stderr,
+        )
+        return 1
+
     # ---- Rich availability check (lazy import, never breaks non-Rich envs) ----
     try:
         from rich.live import Live
@@ -1704,6 +1791,45 @@ def cmd_doctor(_args) -> int:
             warn("target repo", "CWD does not appear to be inside a git repo")
     except Exception:
         warn("target repo", "CWD does not appear to be inside a git repo")
+
+    # 8. Session token expiry
+    import os as _os
+    creds_raw = ""
+    if sys.platform == "darwin":
+        _ks = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials",
+             "-a", _os.getenv("USER", ""), "-w"],
+            capture_output=True, text=True,
+        )
+        if _ks.returncode == 0:
+            creds_raw = _ks.stdout.strip()
+    if not creds_raw:
+        _creds_file = Path.home() / ".claude" / ".credentials.json"
+        if _creds_file.exists():
+            try:
+                creds_raw = _creds_file.read_text()
+            except Exception:
+                pass
+    if creds_raw:
+        try:
+            _creds = json.loads(creds_raw)
+            _exp = _creds.get("claudeAiOauth", {}).get("expiresAt")
+            if _exp:
+                _exp_ts = int(_exp) / 1000.0
+                _remaining = _exp_ts - time.time()
+                if _remaining < 0:
+                    fail("session token", "EXPIRED — re-run ./setup to refresh")
+                elif _remaining < 3600:
+                    warn("session token", f"expires in {int(_remaining / 60)}m — re-run ./setup soon")
+                else:
+                    ok("session token", f"valid for ~{int(_remaining / 3600)}h {int((_remaining % 3600) / 60)}m")
+            else:
+                warn("session token", "no expiresAt in credentials — cannot verify freshness")
+        except Exception as _e:
+            warn("session token", f"could not parse credentials: {_e}")
+    else:
+        warn("session token", "no local credentials found — run ./setup if using session auth")
 
     # Summary
     total = passed + failed

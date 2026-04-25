@@ -382,6 +382,15 @@ def poll_local(task: Task, base_branch: str) -> dict | None:
     if push.returncode != 0:
         return {"status": "failed", "error": f"git push: {push.stderr}"}
 
+    # Pre-flight: adopt an existing open PR for this branch (e.g. Claude opened
+    # its own PR despite the "don't ship/PR yourself" constraint).
+    _pre_check = _run([
+        "gh", "pr", "list", "--head", branch, "--state", "open",
+        "--json", "url", "--jq", ".[0].url",
+    ])
+    if _pre_check.returncode == 0 and _pre_check.stdout.strip():
+        return {"status": "shipped", "pr_url": _pre_check.stdout.strip()}
+
     # Open PR (against the actual base branch)
     pr_body = _make_pr_body(task, target="local")
     pr_result = _run([
@@ -392,8 +401,9 @@ def poll_local(task: Task, base_branch: str) -> dict | None:
         "--body", pr_body,
     ])
     if pr_result.returncode != 0:
-        # Common case: PR already exists (re-run of same task-id). Fetch its URL.
-        existing = _run(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"])
+        # Secondary fallback: gh pr create failed for another reason; try fetching URL.
+        existing = _run(["gh", "pr", "list", "--head", branch, "--state", "open",
+                         "--json", "url", "--jq", ".[0].url"])
         if existing.returncode == 0 and existing.stdout.strip():
             return {"status": "shipped", "pr_url": existing.stdout.strip()}
         return {"status": "pushed_no_pr", "error": f"gh pr create: {pr_result.stderr}"}
