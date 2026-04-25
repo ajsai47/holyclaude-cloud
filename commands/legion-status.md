@@ -16,6 +16,6 @@ Run `~/holyclaude-cloud/bin/legion status` and render the output.
 
 If the user passed a task ID as argument, also tail that task's transcript:
 - Local: `tail -n 50 .legion/local_logs/<task-id>.log`
-- Cloud: `tail -n 50 .legion/cloud_results/<task-id>.json` (summary) — for full transcript run `/Users/ajsai47/tinker-env/bin/modal volume get holyclaude-cloud-worker-cache <task-id>/transcript.jsonl -`.
+- Cloud: `tail -n 50 .legion/cloud_results/<task-id>.json` (summary) — for full transcript run `modal volume get holyclaude-cloud-worker-cache <task-id>/transcript.jsonl -`.
 
 If `.legion/state.json` doesn't exist, tell the user: "No active legion run in this repo. Start one with `/legion-start`."

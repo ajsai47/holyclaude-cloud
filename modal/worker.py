@@ -13,11 +13,11 @@ Lifecycle:
   8. Return a status dict the orchestrator can read.
 
 Launch (from local orchestrator):
-    /Users/ajsai47/tinker-env/bin/modal run modal/worker.py::run_task \\
+    modal run modal/worker.py::run_task \\
         --task-id "T-001" \\
         --title "Add foo to bar" \\
         --prompt "..." \\
-        --repo-url "https://github.com/ajsai47/myrepo.git" \\
+        --repo-url "https://github.com/owner/myrepo.git" \\
         --base-branch "main"
 """
 from __future__ import annotations

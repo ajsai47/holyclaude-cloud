@@ -5,7 +5,7 @@ Common failure modes + how to diagnose them. Every entry came from a real sessio
 ## Setup & prerequisites
 
 ### "modal CLI not found"
-Install: `pip install modal` into a Python env you control. The setup script checks `/Users/ajsai47/tinker-env/bin/modal` first, then falls back to PATH. If your modal lives elsewhere, edit `MODAL_BIN_CANDIDATES` in `lib/dispatch.py`.
+Install: `pip install modal` into a Python env you control. The setup script checks common virtualenv locations then falls back to PATH. If your modal lives elsewhere, edit `MODAL_BIN_CANDIDATES` in `lib/dispatch.py`.
 
 ### "Could not locate Claude credentials"
 On macOS: `security find-generic-password -s 'Claude Code-credentials' -w` should return JSON. If it errors, log into Claude Code once — that populates the keychain entry.

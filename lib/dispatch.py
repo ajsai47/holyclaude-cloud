@@ -26,8 +26,8 @@ from .state import Task
 
 
 MODAL_BIN_CANDIDATES = [
-    "/Users/ajsai47/tinker-env/bin/modal",
     os.path.expanduser("~/tinker-env/bin/modal"),
+    os.path.expanduser("~/.local/bin/modal"),
 ]
 
 

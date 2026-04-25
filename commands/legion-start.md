@@ -38,7 +38,7 @@ If neither `--resume` nor a goal/file is provided, STOP and ask what to build.
 ```bash
 git status --porcelain               # must be empty — refuse if dirty
 test -f ./legion.toml                # copy from ~/holyclaude-cloud/config/legion.toml.example if missing
-/Users/ajsai47/tinker-env/bin/modal secret list | grep claude-pro-session  # else tell user to run ~/holyclaude-cloud/setup
+modal secret list | grep claude-pro-session  # else tell user to run ~/holyclaude-cloud/setup
 ```
 
 ### 2. Resume vs fresh
