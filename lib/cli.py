@@ -26,6 +26,39 @@ from pathlib import Path
 from . import critic, dispatch, governor, mediator, reconciler, reviewer, routing, state
 from .config import load as load_config
 
+# Brain retro tracking — module-level so it persists across ticks within one run.
+_brain_written_ids: set[str] = set()
+
+
+def _flush_brain_retros(s: "state.RunState", goal: str = "") -> None:
+    """Write Retros to the brain for any newly-terminal tasks."""
+    from . import brain as _brain
+    try:
+        store = _brain.default_store()
+    except Exception:
+        return
+    for task in s.tasks.values():
+        if task.id in _brain_written_ids:
+            continue
+        terminal = (
+            task.merged_at is not None
+            or task.status in ("no_changes", "failed", "claude_failed", "cancelled")
+            or (task.status == "shipped" and task.merge_blocker is not None)
+        )
+        if not terminal:
+            continue
+        try:
+            retro = _brain.make_retro_from_task(
+                task,
+                repo_url=s.repo_url,
+                goal=goal or s.repo_url,
+                ci_failed_first_try=(task.mediator_attempts > 0),
+            )
+            store.write(retro)
+            _brain_written_ids.add(task.id)
+        except Exception:
+            pass
+
 
 def _run_cmd(cmd: list[str]) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -999,6 +1032,8 @@ def cmd_decompose(args) -> int:
     Path(".legion").mkdir(exist_ok=True)
     out_path = Path(".legion/tasks.json")
     out_path.write_text(json.dumps(tasks, indent=2))
+    # Save goal so the brain can group retros across re-runs of the same goal.
+    Path(".legion/goal.txt").write_text(goal)
 
     print(f"\nDecomposed into {len(tasks)} task(s) → {out_path}\n")
     for t in tasks:
@@ -1206,6 +1241,10 @@ def cmd_run(args) -> int:
     tick_s = max(1, args.tick_seconds)
     quiet = args.quiet
     max_ticks = args.max_ticks or 0  # 0 = unbounded
+
+    # Load goal text for brain retro grouping (written by `legion decompose`).
+    _goal_path = Path(".legion/goal.txt")
+    _goal = _goal_path.read_text().strip() if _goal_path.exists() else ""
 
     # Must run from inside the target git repo — workers use git worktrees from CWD.
     _git_ok = subprocess.run(
@@ -1506,6 +1545,9 @@ def cmd_run(args) -> int:
                     _narrate(f"\u21a9 {task.id}  CI failed \u2014 re-dispatching (retry {retry_num}/2)")
 
                 _prev_statuses[task.id] = cur_st
+
+            # Flush brain retros for newly terminal tasks (no-op if brain unavailable)
+            _flush_brain_retros(s2, _goal)
 
             # ---- Update live table or emit plain status line ----
             if use_rich and live is not None:

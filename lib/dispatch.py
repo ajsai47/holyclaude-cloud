@@ -53,8 +53,8 @@ _cloud_first_dispatch_notified = False
 # Framing — same prompt structure for local + cloud
 # ----------------------------------------------------------------------
 
-def frame_prompt(task: Task, base_branch: str, branch_name: str) -> str:
-    return (
+def frame_prompt(task: Task, base_branch: str, branch_name: str, retros=None) -> str:
+    base = (
         f"You are worker {task.id} in a HolyClaude legion. Your task:\n\n"
         f"# {task.title}\n\n"
         f"{task.spec}\n\n"
@@ -64,13 +64,37 @@ def frame_prompt(task: Task, base_branch: str, branch_name: str) -> str:
         f"- When you're done, stop. Don't ship/PR yourself — the worker harness will.\n"
         f"- If the task is unclear or impossible as specified, write your reasoning to .legion/blockers/{task.id}.md and stop.\n"
     )
+    if not retros:
+        return base
+
+    parts = [
+        base,
+        "\n## Past experience on this repo\n",
+        "The following retros from previous legion runs may help you avoid known pitfalls:\n",
+    ]
+    for r in retros[:5]:
+        age_s = int(time.time() - r.timestamp)
+        age_str = f"{age_s // 3600}h ago" if age_s >= 3600 else f"{age_s // 60}m ago"
+        summary = (r.task_spec_summary or "")[:100].replace("\n", " ")
+        parts.append(f"\n**{r.task_id}** ({r.outcome}, {age_str}): {summary}")
+        if r.files_touched:
+            parts.append(f"  Files: {', '.join(r.files_touched[:5])}")
+        if r.lessons:
+            parts.append(f"  Lesson: {r.lessons}")
+        for issue in (r.review_issues or [])[:2]:
+            sev = issue.get("severity", "")
+            cat = issue.get("category", "")
+            msg = (issue.get("message") or "")[:120]
+            if msg:
+                parts.append(f"  Review [{sev}/{cat}]: {msg}")
+    return "\n".join(parts)
 
 
 # ----------------------------------------------------------------------
 # Local spawn (subprocess)
 # ----------------------------------------------------------------------
 
-def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
+def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str = "session", repo_url: str = "") -> dict:
     """Fire off a local `claude -p` in a git worktree. Returns spawn metadata."""
     from shutil import which
     if not which("claude"):
@@ -122,7 +146,24 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str
     log_path = LOCAL_LOG_ROOT / f"{task.id}.log"
     log_fh = open(log_path, "wb")
 
-    framed = frame_prompt(task, base_branch, branch_name)
+    # Query brain for relevant past retros to inject into the prompt.
+    _retros = []
+    if repo_url:
+        try:
+            from . import brain as _brain
+            _goal_path = Path(".legion/goal.txt")
+            _goal = _goal_path.read_text().strip() if _goal_path.exists() else ""
+            _store = _brain.default_store()
+            _retros = _store.search(
+                repo_url=repo_url,
+                files=task.files_touched if task.files_touched else None,
+                text=task.title[:60] if task.title else None,
+                limit=5,
+            )
+        except Exception:
+            pass
+
+    framed = frame_prompt(task, base_branch, branch_name, retros=_retros or None)
     cmd = [
         "claude", "-p", framed,
         "--permission-mode", "bypassPermissions",
@@ -583,7 +624,7 @@ def kill_cloud(task: Task, signal_num: int = 15) -> bool:
 
 def spawn(task: Task, target: str, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
     if target == "local":
-        return spawn_local(task, base_branch, branch_prefix, auth_mode=auth_mode)
+        return spawn_local(task, base_branch, branch_prefix, auth_mode=auth_mode, repo_url=repo_url)
     if target == "cloud":
         return spawn_cloud(task, repo_url, base_branch, branch_prefix, auth_mode=auth_mode)
     raise ValueError(f"unknown target {target!r}")
