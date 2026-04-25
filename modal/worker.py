@@ -141,6 +141,7 @@ def run_task(
     pr_body: str = "",
     branch_prefix: str = "legion/",
     auth_mode: str = "session",
+    retro_context: str = "",
 ) -> dict:
     """Execute one task. Idempotent on task_id — re-running with same id
     will reuse the cached worktree if present."""
@@ -172,7 +173,7 @@ def run_task(
     try:
         return _run_task_body(task_id, title, prompt, repo_url, base_branch,
                               pr_body, branch_prefix, t_start, log, step,
-                              auth_mode=auth_mode)
+                              auth_mode=auth_mode, retro_context=retro_context)
     except subprocess.CalledProcessError as e:
         err = f"subprocess failed: {' '.join(str(a) for a in e.cmd)} -> rc={e.returncode}"
         if e.stderr:
@@ -190,6 +191,7 @@ def _run_task_body(
     task_id, title, prompt, repo_url, base_branch,
     pr_body, branch_prefix, t_start, log, step,
     auth_mode="session",
+    retro_context="",
 ):
     # ---------------------------------------------------------------
     # 1. Auth setup — pick auth_mode
@@ -292,6 +294,33 @@ def _run_task_body(
         f"- When you're done, stop. Don't ship/PR yourself — the worker harness will.\n"
         f"- If the task is unclear or impossible as specified, write your reasoning to .legion/blockers/{task_id}.md and stop.\n"
     )
+    if retro_context:
+        try:
+            _retros_raw = json.loads(retro_context)
+            if _retros_raw:
+                _parts = [
+                    "\n\n## Past experience on this repo\n",
+                    "The following retros from previous legion runs may help you avoid known pitfalls:\n",
+                ]
+                for r in _retros_raw[:5]:
+                    _age_s = int(time.perf_counter() - r.get("timestamp", 0))
+                    _age_str = f"{_age_s // 3600}h ago" if _age_s >= 3600 else f"{_age_s // 60}m ago"
+                    _summary = (r.get("task_spec_summary") or "")[:100].replace("\n", " ")
+                    _parts.append(f"\n**{r.get('task_id')}** ({r.get('outcome')}, {_age_str}): {_summary}")
+                    if r.get("files_touched"):
+                        _parts.append(f"  Files: {', '.join(r['files_touched'][:5])}")
+                    if r.get("lessons"):
+                        _parts.append(f"  Lesson: {r['lessons']}")
+                    for _issue in (r.get("review_issues") or [])[:2]:
+                        _msg = (_issue.get("message") or "")[:120]
+                        if _msg:
+                            _parts.append(
+                                f"  Review [{_issue.get('severity','')}/{_issue.get('category','')}]: {_msg}"
+                            )
+                framed_prompt += "\n".join(_parts)
+                step(f"injected {len(_retros_raw)} past retro(s) into prompt")
+        except Exception as _e:
+            step(f"retro injection skipped: {_e}")
 
     # Disable target-repo .mcp.json before running claude — if any MCP server
     # in the target repo's config fails to init (network, missing creds), Claude

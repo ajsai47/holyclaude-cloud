@@ -49,6 +49,24 @@ LOCAL_LOG_ROOT = Path(".legion/local_logs")
 _cloud_first_dispatch_notified = False
 
 
+def _query_brain(repo_url: str, task: "Task") -> list:
+    """Query the local brain for relevant past retros for this task.
+    Returns an empty list on any error — brain is best-effort."""
+    if not repo_url:
+        return []
+    try:
+        from . import brain as _brain
+        _store = _brain.default_store()
+        return _store.search(
+            repo_url=repo_url,
+            files=task.files_touched if task.files_touched else None,
+            text=task.title[:60] if task.title else None,
+            limit=5,
+        )
+    except Exception:
+        return []
+
+
 # ----------------------------------------------------------------------
 # Framing — same prompt structure for local + cloud
 # ----------------------------------------------------------------------
@@ -94,7 +112,7 @@ def frame_prompt(task: Task, base_branch: str, branch_name: str, retros=None) ->
 # Local spawn (subprocess)
 # ----------------------------------------------------------------------
 
-def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str = "session", repo_url: str = "") -> dict:
+def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str = "session", repo_url: str = "", retros=None) -> dict:
     """Fire off a local `claude -p` in a git worktree. Returns spawn metadata."""
     from shutil import which
     if not which("claude"):
@@ -146,24 +164,7 @@ def spawn_local(task: Task, base_branch: str, branch_prefix: str, auth_mode: str
     log_path = LOCAL_LOG_ROOT / f"{task.id}.log"
     log_fh = open(log_path, "wb")
 
-    # Query brain for relevant past retros to inject into the prompt.
-    _retros = []
-    if repo_url:
-        try:
-            from . import brain as _brain
-            _goal_path = Path(".legion/goal.txt")
-            _goal = _goal_path.read_text().strip() if _goal_path.exists() else ""
-            _store = _brain.default_store()
-            _retros = _store.search(
-                repo_url=repo_url,
-                files=task.files_touched if task.files_touched else None,
-                text=task.title[:60] if task.title else None,
-                limit=5,
-            )
-        except Exception:
-            pass
-
-    framed = frame_prompt(task, base_branch, branch_name, retros=_retros or None)
+    framed = frame_prompt(task, base_branch, branch_name, retros=retros or None)
     cmd = [
         "claude", "-p", framed,
         "--permission-mode", "bypassPermissions",
@@ -472,7 +473,7 @@ def kill_local(task: Task, signal_num: int = 15) -> bool:
 CLOUD_LOG_ROOT = Path(".legion/cloud_logs")
 
 
-def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
+def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session", retros=None) -> dict:
     """Spawn a Modal worker as a background `modal run` subprocess.
 
     `modal run --detach` actually blocks until the remote function returns —
@@ -521,6 +522,10 @@ def spawn_cloud(task: Task, repo_url: str, base_branch: str, branch_prefix: str,
         "--auth-mode", auth_mode,
         "--pr-body", _make_pr_body(task, target="cloud"),
     ]
+    if retros:
+        import json as _json
+        _retro_dicts = [r.to_dict() for r in retros]
+        cmd += ["--retro-context", _json.dumps(_retro_dicts, separators=(',', ':'))]
     proc = subprocess.Popen(
         cmd,
         stdout=log_fh,
@@ -623,10 +628,11 @@ def kill_cloud(task: Task, signal_num: int = 15) -> bool:
 # ----------------------------------------------------------------------
 
 def spawn(task: Task, target: str, repo_url: str, base_branch: str, branch_prefix: str, auth_mode: str = "session") -> dict:
+    retros = _query_brain(repo_url, task)
     if target == "local":
-        return spawn_local(task, base_branch, branch_prefix, auth_mode=auth_mode, repo_url=repo_url)
+        return spawn_local(task, base_branch, branch_prefix, auth_mode=auth_mode, repo_url=repo_url, retros=retros)
     if target == "cloud":
-        return spawn_cloud(task, repo_url, base_branch, branch_prefix, auth_mode=auth_mode)
+        return spawn_cloud(task, repo_url, base_branch, branch_prefix, auth_mode=auth_mode, retros=retros)
     raise ValueError(f"unknown target {target!r}")
 
 
