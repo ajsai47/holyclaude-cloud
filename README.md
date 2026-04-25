@@ -38,9 +38,9 @@
 
 One goal in. Merged PRs out. The orchestrator decomposed the work, routed tasks to cloud workers, an adversarial reviewer read every PR before merge, a CI failure triggered an automatic retry with the failure log as context, and the whole thing landed in dependency order.
 
-## Status: v0.2.0 — alpha
+## Status: v0.4.0 — alpha
 
-End-to-end validated on its own repo ("dogfood") plus a sandbox. Ships PRs that merge cleanly when CI passes. Not yet tested on production codebases, protected branches, or repos with pre-commit hooks. See [STATUS.md](STATUS.md) for a grade card and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for known edges.
+End-to-end validated on its own repo ("dogfood") plus a sandbox. Ships PRs that merge cleanly when CI passes. Brain/learning loop is live — workers accumulate experience across runs. CI re-dispatch validated end-to-end. Not yet tested on production codebases or repos with pre-commit hooks. See [STATUS.md](STATUS.md) for a grade card and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for known edges.
 
 ## Architecture
 
@@ -52,6 +52,7 @@ End-to-end validated on its own repo ("dogfood") plus a sandbox. Ships PRs that 
 │  Layer 7:  MEDIATOR     Merge conflict resolution                │
 │  Layer 6:  DISPATCHER   Local Agent vs cloud Modal — auto-route  │
 │  Layer 5:  ORCHESTRATOR Decomposes plan → critic → refiner       │
+│  Layer 5c: BRAIN        Write-on-finish retros, read-on-spawn    │
 ├──────────────────────────────────────────────────────────────────┤
 │  Layers 0-4: HolyClaude (memory, browser, plugins, workflow,     │
 │              team, research) — peer dependency + baked into      │
@@ -80,6 +81,7 @@ Most "AI coding tools" run one agent at a time. Legion runs N in parallel and co
 - **Adversarial review** — a separate Claude instance reads every PR before merge, not just the worker that wrote it
 - **CI-aware re-dispatch** — if CI fails, the next worker gets the failure log as context and tries again with that information
 - **Conflict mediation** — merge conflicts trigger a dedicated mediator agent with both diffs as context, resolving by intent
+- **Brain/learning loop** — every merged or failed task writes a retro to `~/.holyclaude-cloud/brain/`; future workers on the same repo receive relevant past retros as context at spawn time, compounding quality across runs
 - **Cost cap** — `max_dollars_per_hour` kills the run if API spend exceeds budget; the governor detects 429s and backs off dynamically
 
 ## Requirements
@@ -116,8 +118,12 @@ Run from inside the target repo — the reconciler and reviewer need git context
 ```bash
 cd /path/to/your-target-repo
 cp ~/holyclaude-cloud/config/legion.toml.example legion.toml
-legion doctor          # verify all deps are healthy before the first run
+legion doctor          # verify deps, auth, and session token before the first run
 ```
+
+`legion doctor` checks Python version, Modal auth, `gh` auth, Claude Code on PATH, and your Claude session token expiry. **Run it before every session** — a mid-run token expiry causes hard failures with no recovery.
+
+> **Branch protection:** if your repo requires PR reviews before merging, add `use_admin_merge = true` to `legion.toml` (requires repo admin). Without it, tasks reach `needs_human` and you approve manually. See [Branch protection and needs_human](#branch-protection-and-needs_human) below.
 
 Then in a Claude Code session inside that repo:
 
@@ -219,16 +225,15 @@ For serious workloads, flip to `auth_mode = "api"` in `legion.toml` and re-run s
 
 ## What's not yet supported
 
-What IS supported: parallel cloud workers, dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry, merge conflict mediation, cost cap enforcement, and end-to-end runs on repos without branch protection or pre-commit hooks.
+What IS supported: parallel cloud workers, dependency-ordered merges, adversarial review with re-dispatch, CI-aware retry (validated end-to-end), merge conflict mediation, cost cap enforcement, brain/learning loop (retros written and injected across runs), and end-to-end runs on repos without branch protection or pre-commit hooks.
 
 What isn't supported yet:
 
-- **Branch protection with required reviewers / CODEOWNERS** — `gh pr merge` fails; tasks hit `needs_human`
-- **Pre-commit hooks** — workers don't run `husky`/`pre-commit`; hook failures mean no PR opens
+- **Branch protection with required reviewers / CODEOWNERS** — `gh pr merge` fails; tasks hit `needs_human`. Workaround: `use_admin_merge = true` in `legion.toml` if you're a repo admin.
+- **Pre-commit hooks** — workers don't run `husky`/`pre-commit`; hook failures mean no PR opens. `legion doctor` warns if hooks are detected.
 - **Large repos (1GB+)** — every cloud worker does a fresh clone; use `--target local` for big repos
 - **Large diffs (>40KB)** — reviewer truncates to head + tail; large diffs get conservative `warnings` verdicts
-- **Shared memory between workers** — the Modal volume is mounted but not yet read/written; "compounding growth" is Phase 5c, not shipped
-- **CI re-dispatch on real CI failures** — the code path exists in the reconciler but hasn't been exercised end-to-end on a real CI failure yet
+- **`auth_mode = "api"` end-to-end** — the secret pipeline exists and is wired, but hasn't been run in production
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for debugging workflows.
 
